@@ -163,6 +163,33 @@ def is_logged_out(page) -> bool:
         return False
 
 
+_LOGIN_FIELD_SELECTOR = (
+    'input[type="password"], input[name="identifier"], input[name="username"], '
+    '#okta-signin-username'
+)
+
+
+def find_login_scope(page, log):
+    """Returns whichever Page or Frame actually contains the login fields. Okta often
+    renders its sign-in widget inside an iframe (seen live: #account-chooser-iframe)
+    rather than at the top level, so a top-level-only search can silently find
+    nothing and skip the login attempt entirely."""
+    try:
+        if page.locator(_LOGIN_FIELD_SELECTOR).count() > 0:
+            return page
+    except Exception:
+        pass
+    for frame in page.frames:
+        try:
+            if frame.locator(_LOGIN_FIELD_SELECTOR).count() > 0:
+                return frame
+        except Exception:
+            continue
+    log(f"No login fields found at top level or in any iframe. Frames present: "
+        + str([f.url for f in page.frames]))
+    return page  # fall back so the caller's own diagnostics still fire
+
+
 def attempt_credential_login(page, log) -> bool:
     """If FEDEX_USERNAME / FEDEX_PASSWORD are set, tries to fill and submit FedEx's
     login form. Returns True if that got past the password screen. These selectors
@@ -178,33 +205,36 @@ def attempt_credential_login(page, log) -> bool:
         return False
 
     # The actual login form lives on FedEx's Okta SSO page (purpleid.okta.com), reached
-    # after clicking Sign In -- and Okta frequently splits this into two steps
-    # (username -> Next -> password) rather than one combined form. Handle both.
+    # after clicking Sign In -- often inside an iframe, and Okta frequently splits this
+    # into two steps (username -> Next -> password) rather than one combined form.
     try:
-        user_field = page.locator(
+        scope = find_login_scope(page, log)
+
+        user_field = scope.locator(
             'input[name="identifier"], input[name="username"], '
             '#okta-signin-username, input[type="email"], '
             'input[name*="user" i], input[id*="user" i]'
         ).first
         if user_field.count() == 0:
-            user_field = page.get_by_label(re.compile(r"user\s*(id|name)|email", re.I)).first
+            user_field = scope.get_by_label(re.compile(r"user\s*(id|name)|email", re.I)).first
         user_field.fill(username, timeout=8000)
 
-        if page.locator('input[type="password"]').count() == 0:
+        if scope.locator('input[type="password"]').count() == 0:
             # Two-step flow: submit the username first and wait for the password step.
-            next_btn = page.get_by_role("button", name=re.compile(r"next|continue|submit", re.I)).first
+            next_btn = scope.get_by_role("button", name=re.compile(r"next|continue|submit", re.I)).first
             if next_btn.count() == 0:
-                next_btn = page.locator('input[type="submit"]').first
+                next_btn = scope.locator('input[type="submit"]').first
             if next_btn.count() > 0:
                 next_btn.click(timeout=8000)
                 page.wait_for_timeout(2500)
+                scope = find_login_scope(page, log)  # the password step may be a new iframe
 
-        pass_field = page.locator('input[type="password"], #okta-signin-password').first
+        pass_field = scope.locator('input[type="password"], #okta-signin-password').first
         pass_field.fill(password, timeout=8000)
 
-        submit = page.get_by_role("button", name=re.compile(r"sign\s*in|log\s*in|verify", re.I)).first
+        submit = scope.get_by_role("button", name=re.compile(r"sign\s*in|log\s*in|verify", re.I)).first
         if submit.count() == 0:
-            submit = page.locator('input[type="submit"], #okta-signin-submit').first
+            submit = scope.locator('input[type="submit"], #okta-signin-submit').first
         submit.click(timeout=8000)
         page.wait_for_timeout(4000)
     except Exception as e:
@@ -259,15 +289,18 @@ def goto_pickup_manifest(ctx, page, log):
             except Exception as e:
                 log(f"Found a Sign In control but clicking it failed: {e!r}")
 
-    if is_logged_out(page):
+    # Being on okta.com at all means we're not actually logged in yet, even if the
+    # top-level page has no <input type="password"> -- Okta's widget is often inside
+    # an iframe (find_login_scope handles that), so don't rely on is_logged_out()
+    # alone to decide whether a login attempt is needed.
+    if is_logged_out(page) or "okta.com" in page.url:
         if attempt_credential_login(page, log):
             page.wait_for_timeout(1000)
         else:
-            log("Saved session appears to be logged out (a password field is "
-                "showing), and no automatic login succeeded. If you've set "
-                "FEDEX_USERNAME/FEDEX_PASSWORD, check the log output above for why "
-                "the login attempt failed; otherwise re-run fedex_login.py locally "
-                "and update the storage_state secret.")
+            log("Saved session appears to be logged out, and no automatic login "
+                "succeeded. If you've set FEDEX_USERNAME/FEDEX_PASSWORD, check the "
+                "log output above for why the login attempt failed; otherwise "
+                "re-run fedex_login.py locally and update the storage_state secret.")
             return "LOGGED_OUT"
 
     log(f"Appears logged in. URL: {page.url!r}, title: {page.title()!r}")
