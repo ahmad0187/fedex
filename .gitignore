@@ -1,0 +1,10 @@
+# Never commit the live session or real manifest exports -- these are FedEx account
+# data, not something that belongs in git history even in a private repo.
+storage_state.json
+downloads/
+fedex_profile/
+*.xls
+*.xlsx
+!sample_manifest.xls
+__pycache__/
+*.pyc
