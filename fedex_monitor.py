@@ -237,6 +237,35 @@ def goto_pickup_manifest(ctx, page, log):
 
     log(f"Appears logged in. URL: {page.url!r}, title: {page.title()!r}")
 
+    # A fresh login (new IP/device, as a CI runner always is) can land on an F5
+    # access-policy interstitial (URL contains "my.policy") instead of straight on the
+    # PeopleSoft homepage -- not something seen during live testing with an already-
+    # established session. Best-effort click through it, and log what's actually on
+    # the page either way, since the exact wording here hasn't been confirmed yet.
+    if "my.policy" in page.url:
+        try:
+            visible_links = page.locator("a, button, input[type='submit']").all_text_contents()
+        except Exception:
+            visible_links = []
+        log(f"Landed on an F5 policy/portal page ({page.title()!r}). "
+            f"Visible links/buttons: {[t.strip() for t in visible_links if t.strip()]}")
+        try:
+            candidate = page.get_by_role(
+                "link", name=re.compile("mybizaccount|my biz|continue|portal", re.I)
+            ).first
+            if candidate.count() == 0:
+                candidate = page.locator("a, button").filter(
+                    has_text=re.compile("mybizaccount|my biz|continue|portal", re.I)
+                ).first
+            if candidate.count() > 0:
+                candidate.click(timeout=8000)
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(2000)
+                log(f"After clicking through the policy page -- URL: {page.url!r}, "
+                    f"title: {page.title()!r}")
+        except Exception as e:
+            log(f"Could not click through the policy page: {e!r}")
+
     fcc_page = page
     if "cpc-mi" not in page.url:
         # The homepage's tiles are each their own iframe and load asynchronously, so
