@@ -177,31 +177,46 @@ def attempt_credential_login(page, log) -> bool:
     if not username or not password:
         return False
 
+    # The actual login form lives on FedEx's Okta SSO page (purpleid.okta.com), reached
+    # after clicking Sign In -- and Okta frequently splits this into two steps
+    # (username -> Next -> password) rather than one combined form. Handle both.
     try:
-        user_field = page.get_by_label(re.compile(r"user\s*id", re.I)).first
+        user_field = page.locator(
+            'input[name="identifier"], input[name="username"], '
+            '#okta-signin-username, input[type="email"], '
+            'input[name*="user" i], input[id*="user" i]'
+        ).first
         if user_field.count() == 0:
-            user_field = page.locator(
-                'input[name*="user" i], input[id*="user" i], input[type="email"]'
-            ).first
+            user_field = page.get_by_label(re.compile(r"user\s*(id|name)|email", re.I)).first
         user_field.fill(username, timeout=8000)
 
-        pass_field = page.locator('input[type="password"]').first
+        if page.locator('input[type="password"]').count() == 0:
+            # Two-step flow: submit the username first and wait for the password step.
+            next_btn = page.get_by_role("button", name=re.compile(r"next|continue|submit", re.I)).first
+            if next_btn.count() == 0:
+                next_btn = page.locator('input[type="submit"]').first
+            if next_btn.count() > 0:
+                next_btn.click(timeout=8000)
+                page.wait_for_timeout(2500)
+
+        pass_field = page.locator('input[type="password"], #okta-signin-password').first
         pass_field.fill(password, timeout=8000)
 
-        submit = page.get_by_role("button", name=re.compile(r"log\s*in|sign\s*in", re.I)).first
+        submit = page.get_by_role("button", name=re.compile(r"sign\s*in|log\s*in|verify", re.I)).first
         if submit.count() == 0:
-            submit = page.locator('input[type="submit"]').first
+            submit = page.locator('input[type="submit"], #okta-signin-submit').first
         submit.click(timeout=8000)
         page.wait_for_timeout(4000)
     except Exception as e:
         log(f"Automatic login attempt raised an error: {e!r}")
         return False
 
-    if is_logged_out(page):
-        log("Still on a login/password screen after attempting automatic login. "
-            "Either a selector above is wrong, or FedEx is showing an MFA/OTP "
-            "challenge this script can't complete unattended. Visible <input> "
-            "fields on this screen, for debugging:")
+    # Still on Okta's domain, or still looking at a password field, means it didn't
+    # actually get through -- most likely an MFA/OTP step this script can't complete
+    # unattended, or a selector above didn't match. Either way, print what's on screen.
+    if "okta.com" in page.url or is_logged_out(page):
+        log(f"Login did not complete. URL: {page.url!r}, title: {page.title()!r}. "
+            "Visible <input> fields, for debugging:")
         try:
             fields = page.locator("input").evaluate_all(
                 "els => els.map(e => ({type: e.type, name: e.name, id: e.id, "
@@ -223,6 +238,26 @@ def goto_pickup_manifest(ctx, page, log):
     if some other step failed."""
     page.goto(HOMEPAGE_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(2000)
+
+    # Not logged in yet, this lands on a pre-login "Welcome to MyBizAccount" page with
+    # just a "Sign In" button -- no password field until that's clicked, which is why
+    # is_logged_out() alone doesn't catch this state. Click it to reveal the real form.
+    if not is_logged_out(page):
+        signin = page.get_by_role("button", name=re.compile(r"sign\s*in", re.I)).first
+        if signin.count() == 0:
+            signin = page.locator(
+                'input[type="submit"][value*="Sign In" i], '
+                'input[type="button"][value*="Sign In" i], '
+                'a:has-text("Sign In")'
+            ).first
+        if signin.count() > 0:
+            try:
+                signin.click(timeout=8000)
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(2000)
+                log(f"Clicked Sign In. URL: {page.url!r}, title: {page.title()!r}")
+            except Exception as e:
+                log(f"Found a Sign In control but clicking it failed: {e!r}")
 
     if is_logged_out(page):
         if attempt_credential_login(page, log):
