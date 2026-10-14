@@ -235,8 +235,23 @@ def goto_pickup_manifest(ctx, page, log):
                 "and update the storage_state secret.")
             return "LOGGED_OUT"
 
+    log(f"Appears logged in. URL: {page.url!r}, title: {page.title()!r}")
+
     fcc_page = page
     if "cpc-mi" not in page.url:
+        # The homepage's tiles are each their own iframe and load asynchronously, so
+        # wait for the specific one we need rather than a fixed sleep -- a headless CI
+        # runner can be slower to render these than a real browser.
+        try:
+            page.wait_for_selector('iframe[title="FCC Links"]', timeout=20000)
+        except PWTimeout:
+            log(f"'FCC Links' iframe never appeared. Current URL: {page.url!r}, "
+                f"title: {page.title()!r}. iframes present: "
+                + str(page.locator("iframe").evaluate_all(
+                    "els => els.map(e => ({id: e.id, title: e.title, name: e.name}))"
+                )))
+            return None
+
         # The homepage's tiles are each their own iframe; "FedEx Customer Connection"
         # lives inside the one titled "FCC Links" and opens the app in a NEW tab.
         try:
@@ -247,8 +262,9 @@ def goto_pickup_manifest(ctx, page, log):
             fcc_page.wait_for_load_state("domcontentloaded")
             fcc_page.wait_for_timeout(2000)
         except PWTimeout:
-            log("Could not find/click 'FedEx Customer Connection' in the FCC Links "
-                "tile on the homepage.")
+            log("Could not find/click 'FedEx Customer Connection' inside the FCC "
+                "Links iframe (the iframe itself did render). Links visible in it: "
+                + str(frame.locator("a, [role='link']").all_text_contents()))
             return None
 
     # Make sure the Pickup Manifest (P&D Manifests) tab is selected.
