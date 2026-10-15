@@ -280,25 +280,27 @@ def robust_click(locator, log, description: str) -> bool:
         info = None
     log(f"About to click {description}. Matched element: {info!r}")
 
+    err1 = err2 = err3 = None
     try:
         locator.click(timeout=8000)
         log(f"Clicked {description} normally.")
         return True
-    except Exception as e1:
-        pass
+    except Exception as e:
+        err1 = repr(e)
     try:
         locator.click(timeout=4000, force=True)
-        log(f"Clicked {description} with force=True (normal click failed: {e1!r}).")
+        log(f"Clicked {description} with force=True (normal click failed: {err1}).")
         return True
-    except Exception as e2:
-        pass
+    except Exception as e:
+        err2 = repr(e)
     try:
         locator.evaluate("el => el.click()")
         log(f"Clicked {description} via raw JS el.click() (both real clicks failed: "
-            f"{e1!r}, {e2!r}).")
+            f"{err1}, {err2}).")
         return True
-    except Exception as e3:
-        log(f"Could not click {description} by any method: {e3!r}")
+    except Exception as e:
+        err3 = repr(e)
+        log(f"Could not click {description} by any method: {err3}")
         return False
 
 
