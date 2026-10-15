@@ -424,7 +424,14 @@ def goto_pickup_manifest(ctx, page, log):
             + fcc_page.locator("body").inner_text()[:500])
         return None
 
-    fcc_page.wait_for_timeout(3000)
+    # A full manifest (dozens of rows, seen live) can take noticeably longer than a
+    # few seconds to actually render after Search -- wait for the "N records found"
+    # text FedEx shows once results are in, rather than guessing a fixed delay.
+    try:
+        fcc_page.wait_for_selector("text=/records found/i", timeout=25000)
+    except PWTimeout:
+        pass  # fall through -- export_and_download's own wait/diagnostics cover this
+    fcc_page.wait_for_timeout(1000)
     return fcc_page
 
 
@@ -471,7 +478,7 @@ def export_and_download(page, log, ctx=None) -> Path | None:
     # rendering than a fixed short sleep -- wait for the actual export control to
     # show up rather than guessing a delay, before trying anything else.
     try:
-        page.wait_for_selector('input[name="manifestForm:buttonGenerateExcel"]', timeout=10000)
+        page.wait_for_selector('input[name="manifestForm:buttonGenerateExcel"]', timeout=25000)
     except PWTimeout:
         pass  # fall through to dismiss_popups/candidates/diagnostics below either way
 
