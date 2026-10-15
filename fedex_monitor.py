@@ -503,35 +503,22 @@ def export_and_download(page, log, ctx=None) -> Path | None:
 
         dest = DOWNLOAD_DIR / f"manifest_{datetime.now():%Y%m%d_%H%M%S}.xls"
 
-        # Try it as a normal same-tab download first.
+        # Confirmed live behavior: clicking this opens a NEW window that downloads
+        # the file and then closes itself automatically -- often too fast to reliably
+        # grab a reference to that popup page and attach a download listener to it
+        # after the fact. A context-level "download" listener catches the event no
+        # matter which page (this one, or a popup that's already gone) fired it, so
+        # that's used here instead of page.expect_download()/ctx.expect_page().
+        downloader = ctx if ctx is not None else page.context
         try:
-            with page.expect_download(timeout=20000) as dl_info:
+            with downloader.expect_event("download", timeout=25000) as dl_info:
                 if not robust_click(loc, log, "the Excel export control"):
                     raise RuntimeError("click itself failed")
             dl_info.value.save_as(dest)
             return dest
-        except Exception:
-            pass
-
-        # Some ICEfaces exports open the file in a NEW tab/window instead of firing a
-        # normal browser download event -- try that path too before giving up on this
-        # candidate entirely.
-        if ctx is not None:
-            try:
-                with ctx.expect_page(timeout=8000) as new_page_info:
-                    robust_click(loc, log, "the Excel export control (new-tab attempt)")
-                new_page = new_page_info.value
-                new_page.wait_for_load_state("domcontentloaded")
-                try:
-                    with new_page.expect_download(timeout=10000) as dl_info2:
-                        pass  # some sites auto-trigger the download on load
-                    dl_info2.value.save_as(dest)
-                    new_page.close()
-                    return dest
-                except Exception:
-                    new_page.close()
-            except Exception:
-                pass
+        except Exception as e:
+            log(f"Download did not complete for this candidate: {e!r}")
+            continue
 
     # Nothing worked -- dump what IS on screen so this is a quick fix, not a guess.
     try:
