@@ -438,10 +438,15 @@ def dismiss_popups(page, log, max_rounds: int = 3) -> None:
     for _ in range(max_rounds):
         closed_this_round = 0
         try:
+            # Broad on purpose: the live page showed plain text 'close' on screen,
+            # which could be a <button>, <a>, <span> or <div> -- not necessarily
+            # something with an ARIA "button" role, so match by visible text too.
             candidates = page.get_by_role("button", name=close_pattern).all()
+            candidates += page.get_by_role("link", name=close_pattern).all()
             candidates += page.locator(
                 "[aria-label='Close' i], [title='Close' i], .close, .ui-dialog-titlebar-close"
             ).all()
+            candidates += page.get_by_text(close_pattern, exact=True).all()
         except Exception:
             candidates = []
         for c in candidates:
@@ -489,11 +494,17 @@ def export_and_download(page, log) -> Path | None:
 
     # Nothing worked -- dump what IS on screen so this is a quick fix, not a guess.
     try:
-        icons = page.locator("img, a, button").all_text_contents()
-        log("Could not find the Excel export control. Visible clickable elements on "
-            "this screen were:\n  " + "\n  ".join(repr(t) for t in icons[:40] if t.strip()))
-    except Exception:
-        pass
+        elements = page.locator("img, a, button, span, div").evaluate_all(
+            "els => els.filter(e => e.innerText && e.innerText.trim().length && "
+            "e.innerText.trim().length < 40 && e.offsetParent !== null)"
+            ".slice(0, 40).map(e => ({tag: e.tagName, text: e.innerText.trim(), "
+            "id: e.id, cls: e.className}))"
+        )
+        log("Could not find the Excel export control. Visible elements with short text "
+            "on this screen were:\n  " + "\n  ".join(str(e) for e in elements))
+    except Exception as e:
+        log(f"Could not find the Excel export control, and the diagnostic dump itself "
+            f"failed: {e!r}")
     return None
 
 
