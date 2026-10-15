@@ -402,22 +402,28 @@ def goto_pickup_manifest(ctx, page, log):
     # make Playwright's normal actionability checks (occlusion/stability) time out
     # even though the element is really there and a real click would land fine.
     pdm = fcc_page.get_by_text(re.compile(r"^P&D Manifests$", re.I)).first
-    if not robust_click(pdm, log, "'P&D Manifests' tab"):
+    pdm_ok = robust_click(pdm, log, "'P&D Manifests' tab")
+    if not pdm_ok:
         log("Bottom-nav items visible: "
             + str(fcc_page.locator("text=/Messaging|P&D Manifests|Service Area Status|"
                                     "Pickup Alerts|SCH PU Mgmt|P&D Planning/").all_text_contents()))
     fcc_page.wait_for_timeout(1000)
+    log(f"Clicked 'P&D Manifests' tab (ok={pdm_ok}).")
 
     # Work Area -> ALL (it's usually the default, but set it explicitly).
+    wa_ok = False
     try:
         wa = fcc_page.locator("select").filter(has_text="ALL").first
         wa.select_option(label=re.compile(r"^ALL$"))
-    except Exception:
-        pass  # leave whatever it defaults to
+        wa_ok = True
+    except Exception as e:
+        log(f"Could not explicitly set Work Area to ALL (leaving default): {e!r}")
 
     # Click Search.
     search_btn = fcc_page.get_by_role("button", name=re.compile("^Search$", re.I)).first
-    if not robust_click(search_btn, log, "the Search button"):
+    search_ok = robust_click(search_btn, log, "the Search button")
+    log(f"Work Area set ok={wa_ok}; clicked Search ok={search_ok}.")
+    if not search_ok:
         log(f"URL: {fcc_page.url!r}, title: {fcc_page.title()!r}. Buttons visible: "
             + str(fcc_page.get_by_role("button").all_text_contents())
             + ". Page text (first 500 chars): "
@@ -428,9 +434,12 @@ def goto_pickup_manifest(ctx, page, log):
     # few seconds to actually render after Search -- wait for the "N records found"
     # text FedEx shows once results are in, rather than guessing a fixed delay.
     try:
-        fcc_page.wait_for_selector("text=/records found/i", timeout=25000)
+        results_el = fcc_page.wait_for_selector("text=/records found/i", timeout=25000)
+        log(f"Search results rendered: {results_el.inner_text()!r}")
     except PWTimeout:
-        pass  # fall through -- export_and_download's own wait/diagnostics cover this
+        log("Timed out waiting for '...records found' text after clicking Search. "
+            f"Current URL: {fcc_page.url!r}, title: {fcc_page.title()!r}. "
+            "Page text (first 800 chars): " + fcc_page.locator("body").inner_text()[:800])
     fcc_page.wait_for_timeout(1000)
     return fcc_page
 
