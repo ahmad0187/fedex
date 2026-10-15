@@ -267,22 +267,38 @@ def robust_click(locator, log, description: str) -> bool:
     FedEx's nav elements are plain non-interactive tags (<li>, <span>) with a JS click
     handler rather than a real <button>/<a>, which can make Playwright's normal
     actionability wait time out even though the element is genuinely there and
-    clickable. Returns False (after logging) only if all three fail."""
+    clickable. Returns False (after logging) only if all three fail. Also logs which
+    element/method actually fired and which selector matched it -- a click can
+    "succeed" against the wrong element entirely if the locator matched more than
+    one thing or matched something decorative, so that's worth being able to see."""
+    try:
+        info = locator.evaluate(
+            "el => ({tag: el.tagName, id: el.id, type: el.type || null, "
+            "disabled: !!el.disabled, cls: el.className})"
+        )
+    except Exception:
+        info = None
+    log(f"About to click {description}. Matched element: {info!r}")
+
     try:
         locator.click(timeout=8000)
+        log(f"Clicked {description} normally.")
         return True
-    except Exception:
+    except Exception as e1:
         pass
     try:
         locator.click(timeout=4000, force=True)
+        log(f"Clicked {description} with force=True (normal click failed: {e1!r}).")
         return True
-    except Exception:
+    except Exception as e2:
         pass
     try:
         locator.evaluate("el => el.click()")
+        log(f"Clicked {description} via raw JS el.click() (both real clicks failed: "
+            f"{e1!r}, {e2!r}).")
         return True
-    except Exception as e:
-        log(f"Could not click {description} by any method: {e!r}")
+    except Exception as e3:
+        log(f"Could not click {description} by any method: {e3!r}")
         return False
 
 
