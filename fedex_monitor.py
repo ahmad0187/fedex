@@ -464,9 +464,17 @@ def dismiss_popups(page, log, max_rounds: int = 3) -> None:
         log(f"Dismissed {dismissed_total} popup dialog(s) before continuing.")
 
 
-def export_and_download(page, log) -> Path | None:
+def export_and_download(page, log, ctx=None) -> Path | None:
     """Clicks the Excel export control and returns the path of the downloaded file,
     or None if there was nothing to export (zero open stops is a normal outcome)."""
+    # A fuller manifest (dozens of rows, seen live) can take longer to finish
+    # rendering than a fixed short sleep -- wait for the actual export control to
+    # show up rather than guessing a delay, before trying anything else.
+    try:
+        page.wait_for_selector('input[name="manifestForm:buttonGenerateExcel"]', timeout=10000)
+    except PWTimeout:
+        pass  # fall through to dismiss_popups/candidates/diagnostics below either way
+
     dismiss_popups(page, log)
     # Confirmed live: it's `<input type="image" id="manifestForm:buttonGenerateExcel">`,
     # not a normal button/link -- that's tried first; the rest are fallbacks only.
@@ -483,14 +491,40 @@ def export_and_download(page, log) -> Path | None:
             loc = make_locator()
             if loc.count() == 0:
                 continue
-            with page.expect_download(timeout=15000) as dl_info:
-                loc.click()
-            download = dl_info.value
-            dest = DOWNLOAD_DIR / f"manifest_{datetime.now():%Y%m%d_%H%M%S}.xls"
-            download.save_as(dest)
-            return dest
         except Exception:
             continue
+
+        dest = DOWNLOAD_DIR / f"manifest_{datetime.now():%Y%m%d_%H%M%S}.xls"
+
+        # Try it as a normal same-tab download first.
+        try:
+            with page.expect_download(timeout=20000) as dl_info:
+                if not robust_click(loc, log, "the Excel export control"):
+                    raise RuntimeError("click itself failed")
+            dl_info.value.save_as(dest)
+            return dest
+        except Exception:
+            pass
+
+        # Some ICEfaces exports open the file in a NEW tab/window instead of firing a
+        # normal browser download event -- try that path too before giving up on this
+        # candidate entirely.
+        if ctx is not None:
+            try:
+                with ctx.expect_page(timeout=8000) as new_page_info:
+                    robust_click(loc, log, "the Excel export control (new-tab attempt)")
+                new_page = new_page_info.value
+                new_page.wait_for_load_state("domcontentloaded")
+                try:
+                    with new_page.expect_download(timeout=10000) as dl_info2:
+                        pass  # some sites auto-trigger the download on load
+                    dl_info2.value.save_as(dest)
+                    new_page.close()
+                    return dest
+                except Exception:
+                    new_page.close()
+            except Exception:
+                pass
 
     # Nothing worked -- dump what IS on screen so this is a quick fix, not a guess.
     try:
@@ -553,7 +587,7 @@ def run_once(headless: bool, dry_run: bool) -> int:
             conn.close()
             return 1
 
-        xls_path = export_and_download(fcc_page, log)
+        xls_path = export_and_download(fcc_page, log, ctx=ctx)
         browser.close()
 
         if xls_path is None:
