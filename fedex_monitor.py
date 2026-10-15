@@ -68,6 +68,23 @@ FAILURE_ALERT_COOLDOWN_MIN = 120  # don't spam Slack more than once every 2h on 
 
 HOMEPAGE_URL = "https://mybizaccount.fedex.com/"
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+# Optional: a healthchecks.io (or similar) ping URL. Pinged once per run -- the plain
+# URL on success, "<url>/fail" on a failed run -- so that service can show a run
+# history/dashboard and alert if a scheduled run doesn't check in at all (meaning the
+# systemd timer didn't fire, the script crashed before finishing, or the VPS is down).
+# Entirely optional: if unset, this is just skipped.
+HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "").rstrip("/")
+
+
+def ping_healthcheck(log, ok: bool) -> None:
+    if not HEALTHCHECK_URL:
+        return
+    url = HEALTHCHECK_URL if ok else f"{HEALTHCHECK_URL}/fail"
+    try:
+        requests.get(url, timeout=10)
+    except Exception as e:
+        # Never let a monitoring ping itself break the actual monitor.
+        log(f"Healthcheck ping failed (non-fatal): {e!r}")
 
 
 # --------------------------------------------------------------------------- state db
@@ -626,6 +643,7 @@ def run_once(headless: bool, dry_run: bool) -> int:
                        f"{FAILURE_ALERT_COOLDOWN_MIN} minutes while it stays broken)")
                 send_slack(msg, dry_run=dry_run)
             conn.close()
+            ping_healthcheck(log, ok=False)
             return 1
 
         xls_path = export_and_download(fcc_page, log, ctx=ctx)
@@ -635,6 +653,7 @@ def run_once(headless: bool, dry_run: bool) -> int:
             log("No export captured this cycle (could genuinely be zero open pickups "
                 "right now, or the export control needs a one-line selector fix -- see "
                 "any message above).")
+            ping_healthcheck(log, ok=True)
             return 0
 
         log(f"Downloaded {xls_path.name}")
@@ -650,6 +669,7 @@ def run_once(headless: bool, dry_run: bool) -> int:
     for stop in to_send:
         send_slack(format_alert(stop), dry_run=dry_run)
     log(f"Sent {len(to_send)} new/escalated Slack alert(s).")
+    ping_healthcheck(log, ok=True)
     return 0
 
 
