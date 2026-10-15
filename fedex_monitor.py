@@ -358,6 +358,7 @@ def goto_pickup_manifest(ctx, page, log):
             fcc_page = new_page_info.value
             fcc_page.wait_for_load_state("domcontentloaded")
             fcc_page.wait_for_timeout(2000)
+            log(f"Opened FCC. URL: {fcc_page.url!r}, title: {fcc_page.title()!r}")
         except PWTimeout:
             log("Could not find/click 'FedEx Customer Connection' inside the FCC "
                 "Links iframe (the iframe itself did render). Links visible in it: "
@@ -369,7 +370,10 @@ def goto_pickup_manifest(ctx, page, log):
         fcc_page.get_by_text(re.compile(r"^P&D Manifests$", re.I)).first.click(timeout=8000)
         fcc_page.wait_for_timeout(1000)
     except PWTimeout:
-        pass  # may already be on it
+        log("Could not find/click 'P&D Manifests' tab -- continuing anyway in case "
+            "it's already selected. Bottom-nav items visible: "
+            + str(fcc_page.locator("text=/Messaging|P&D Manifests|Service Area Status|"
+                                    "Pickup Alerts|SCH PU Mgmt|P&D Planning/").all_text_contents()))
 
     # Work Area -> ALL (it's usually the default, but set it explicitly).
     try:
@@ -382,7 +386,11 @@ def goto_pickup_manifest(ctx, page, log):
     try:
         fcc_page.get_by_role("button", name=re.compile("^Search$", re.I)).first.click(timeout=8000)
     except PWTimeout:
-        log("Could not find the Search button.")
+        log(f"Could not find the Search button. URL: {fcc_page.url!r}, "
+            f"title: {fcc_page.title()!r}. Buttons visible: "
+            + str(fcc_page.get_by_role("button").all_text_contents())
+            + ". Page text (first 500 chars): "
+            + fcc_page.locator("body").inner_text()[:500])
         return None
 
     fcc_page.wait_for_timeout(3000)
