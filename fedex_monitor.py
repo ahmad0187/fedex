@@ -261,6 +261,31 @@ def attempt_credential_login(page, log) -> bool:
     return True
 
 
+def robust_click(locator, log, description: str) -> bool:
+    """Tries a normal click, then a forced click (skips Playwright's occlusion/
+    visibility actionability checks), then a raw JS .click() as a last resort. Some of
+    FedEx's nav elements are plain non-interactive tags (<li>, <span>) with a JS click
+    handler rather than a real <button>/<a>, which can make Playwright's normal
+    actionability wait time out even though the element is genuinely there and
+    clickable. Returns False (after logging) only if all three fail."""
+    try:
+        locator.click(timeout=8000)
+        return True
+    except Exception:
+        pass
+    try:
+        locator.click(timeout=4000, force=True)
+        return True
+    except Exception:
+        pass
+    try:
+        locator.evaluate("el => el.click()")
+        return True
+    except Exception as e:
+        log(f"Could not click {description} by any method: {e!r}")
+        return False
+
+
 def goto_pickup_manifest(ctx, page, log):
     """Navigation from the FedEx homepage to the Pickup Manifest tab, Work Area = ALL,
     today's date, Search already clicked. Returns the Page the manifest ended up on
@@ -372,15 +397,16 @@ def goto_pickup_manifest(ctx, page, log):
                 + str(frame.locator("a, [role='link']").all_text_contents()))
             return None
 
-    # Make sure the Pickup Manifest (P&D Manifests) tab is selected.
-    try:
-        fcc_page.get_by_text(re.compile(r"^P&D Manifests$", re.I)).first.click(timeout=8000)
-        fcc_page.wait_for_timeout(1000)
-    except PWTimeout:
-        log("Could not find/click 'P&D Manifests' tab -- continuing anyway in case "
-            "it's already selected. Bottom-nav items visible: "
+    # Make sure the Pickup Manifest (P&D Manifests) tab is selected. The bottom-nav
+    # items are plain <li> elements (role="listitem", not button/link), which can
+    # make Playwright's normal actionability checks (occlusion/stability) time out
+    # even though the element is really there and a real click would land fine.
+    pdm = fcc_page.get_by_text(re.compile(r"^P&D Manifests$", re.I)).first
+    if not robust_click(pdm, log, "'P&D Manifests' tab"):
+        log("Bottom-nav items visible: "
             + str(fcc_page.locator("text=/Messaging|P&D Manifests|Service Area Status|"
                                     "Pickup Alerts|SCH PU Mgmt|P&D Planning/").all_text_contents()))
+    fcc_page.wait_for_timeout(1000)
 
     # Work Area -> ALL (it's usually the default, but set it explicitly).
     try:
@@ -390,11 +416,9 @@ def goto_pickup_manifest(ctx, page, log):
         pass  # leave whatever it defaults to
 
     # Click Search.
-    try:
-        fcc_page.get_by_role("button", name=re.compile("^Search$", re.I)).first.click(timeout=8000)
-    except PWTimeout:
-        log(f"Could not find the Search button. URL: {fcc_page.url!r}, "
-            f"title: {fcc_page.title()!r}. Buttons visible: "
+    search_btn = fcc_page.get_by_role("button", name=re.compile("^Search$", re.I)).first
+    if not robust_click(search_btn, log, "the Search button"):
+        log(f"URL: {fcc_page.url!r}, title: {fcc_page.title()!r}. Buttons visible: "
             + str(fcc_page.get_by_role("button").all_text_contents())
             + ". Page text (first 500 chars): "
             + fcc_page.locator("body").inner_text()[:500])
