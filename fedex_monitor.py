@@ -586,7 +586,20 @@ def run_once(headless: bool, dry_run: bool) -> int:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        ctx_kwargs = {"accept_downloads": True}
+        # Force a plain desktop viewport + user-agent. Live runs showed FedEx serving
+        # a MOBILE layout instead (onclick handlers under "ice.mobi.*", elements sitting
+        # off to the side needing a scroll) -- almost certainly because Playwright's
+        # default headless Chromium reports "HeadlessChrome" in its user-agent, which
+        # some sites detect and respond to with a simplified/mobile UI. A real desktop
+        # UA plus a generous viewport should get the same interface a human sees.
+        ctx_kwargs = {
+            "accept_downloads": True,
+            "viewport": {"width": 1600, "height": 1000},
+            "user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+            ),
+        }
         if STORAGE_STATE_PATH.exists():
             ctx_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
         ctx = browser.new_context(**ctx_kwargs)
