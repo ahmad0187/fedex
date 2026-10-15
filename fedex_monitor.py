@@ -425,8 +425,17 @@ def goto_pickup_manifest(ctx, page, log):
         log("Bottom-nav items visible: "
             + str(fcc_page.locator("text=/Messaging|P&D Manifests|Service Area Status|"
                                     "Pickup Alerts|SCH PU Mgmt|P&D Planning/").all_text_contents()))
-    fcc_page.wait_for_timeout(1000)
     log(f"Clicked 'P&D Manifests' tab (ok={pdm_ok}).")
+
+    # The desktop UI loads noticeably slower than the mobile one we were previously
+    # (accidentally) served -- wait for the actual content pane (the Search button,
+    # confirmed live as id="manifestForm:search") rather than a fixed 1s delay.
+    try:
+        fcc_page.wait_for_selector('input[name="manifestForm:search"]', timeout=30000)
+        log("Pickup Manifest form (Date/Work Area/Search) has rendered.")
+    except PWTimeout:
+        log("Timed out waiting for the Pickup Manifest form to render after clicking "
+            f"the tab. Page text so far: {fcc_page.locator('body').inner_text()[:500]!r}")
 
     # Work Area -> ALL (it's usually the default, but set it explicitly).
     wa_ok = False
@@ -437,8 +446,11 @@ def goto_pickup_manifest(ctx, page, log):
     except Exception as e:
         log(f"Could not explicitly set Work Area to ALL (leaving default): {e!r}")
 
-    # Click Search.
-    search_btn = fcc_page.get_by_role("button", name=re.compile("^Search$", re.I)).first
+    # Click Search -- confirmed live as id="manifestForm:search", so target that
+    # directly instead of relying only on a generic role/name search.
+    search_btn = fcc_page.locator('input[name="manifestForm:search"]').first
+    if search_btn.count() == 0:
+        search_btn = fcc_page.get_by_role("button", name=re.compile("^Search$", re.I)).first
     search_ok = robust_click(search_btn, log, "the Search button")
     log(f"Work Area set ok={wa_ok}; clicked Search ok={search_ok}.")
     if not search_ok:
