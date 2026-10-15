@@ -357,7 +357,14 @@ def goto_pickup_manifest(ctx, page, log):
                 frame.get_by_text(re.compile("FedEx Customer Connection", re.I)).first.click(timeout=10000)
             fcc_page = new_page_info.value
             fcc_page.wait_for_load_state("domcontentloaded")
-            fcc_page.wait_for_timeout(2000)
+            # The new tab goes through an intermediate redirect (its title briefly
+            # reads "Loading https://...") before the actual app renders -- wait for a
+            # real element instead of a fixed delay, since that redirect's duration
+            # isn't consistent (fine live, too slow on a CI runner in practice).
+            try:
+                fcc_page.wait_for_selector("text=P&D Manifests", timeout=20000)
+            except PWTimeout:
+                pass  # diagnostics below will show whatever actually loaded
             log(f"Opened FCC. URL: {fcc_page.url!r}, title: {fcc_page.title()!r}")
         except PWTimeout:
             log("Could not find/click 'FedEx Customer Connection' inside the FCC "
@@ -441,7 +448,10 @@ def run_once(headless: bool, dry_run: bool) -> int:
     now_iso = now.isoformat()
 
     def log(msg):
-        print(f"[{now:%Y-%m-%d %H:%M:%S %Z}] {msg}")
+        # Timestamp at call time, not run_once's start time -- otherwise every line
+        # in a run shows the same instant and timing issues (like a navigation step
+        # outrunning the page) are invisible in the logs.
+        print(f"[{datetime.now(STATION_TZ):%Y-%m-%d %H:%M:%S %Z}] {msg}")
 
     have_creds = bool(os.environ.get("FEDEX_USERNAME")) and bool(os.environ.get("FEDEX_PASSWORD"))
     if not STORAGE_STATE_PATH.exists() and not have_creds:
