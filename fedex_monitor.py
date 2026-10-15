@@ -414,7 +414,7 @@ def goto_pickup_manifest(ctx, page, log):
     wa_ok = False
     try:
         wa = fcc_page.locator("select").filter(has_text="ALL").first
-        wa.select_option(label=re.compile(r"^ALL$"))
+        wa.select_option(label="ALL")
         wa_ok = True
     except Exception as e:
         log(f"Could not explicitly set Work Area to ALL (leaving default): {e!r}")
