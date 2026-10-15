@@ -428,9 +428,41 @@ def goto_pickup_manifest(ctx, page, log):
     return fcc_page
 
 
+def dismiss_popups(page, log, max_rounds: int = 3) -> None:
+    """Closes any modal/notification dialogs sitting on top of the page (seen live:
+    the only clickable elements on screen were several 'close' buttons, blocking the
+    actual manifest controls underneath). Best-effort -- clicks anything that looks
+    like a close control, up to a few rounds in case closing one reveals another."""
+    close_pattern = re.compile(r"^(close|×|x|dismiss|ok|got it)$", re.I)
+    dismissed_total = 0
+    for _ in range(max_rounds):
+        closed_this_round = 0
+        try:
+            candidates = page.get_by_role("button", name=close_pattern).all()
+            candidates += page.locator(
+                "[aria-label='Close' i], [title='Close' i], .close, .ui-dialog-titlebar-close"
+            ).all()
+        except Exception:
+            candidates = []
+        for c in candidates:
+            try:
+                if c.is_visible():
+                    c.click(timeout=2000)
+                    closed_this_round += 1
+                    page.wait_for_timeout(500)
+            except Exception:
+                continue
+        dismissed_total += closed_this_round
+        if closed_this_round == 0:
+            break
+    if dismissed_total:
+        log(f"Dismissed {dismissed_total} popup dialog(s) before continuing.")
+
+
 def export_and_download(page, log) -> Path | None:
     """Clicks the Excel export control and returns the path of the downloaded file,
     or None if there was nothing to export (zero open stops is a normal outcome)."""
+    dismiss_popups(page, log)
     # Confirmed live: it's `<input type="image" id="manifestForm:buttonGenerateExcel">`,
     # not a normal button/link -- that's tried first; the rest are fallbacks only.
     candidates = [
