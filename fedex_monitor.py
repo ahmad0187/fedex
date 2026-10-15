@@ -262,15 +262,17 @@ def attempt_credential_login(page, log) -> bool:
 
 
 def robust_click(locator, log, description: str) -> bool:
-    """Tries a normal click, then a forced click (skips Playwright's occlusion/
-    visibility actionability checks), then a raw JS .click() as a last resort. Some of
-    FedEx's nav elements are plain non-interactive tags (<li>, <span>) with a JS click
-    handler rather than a real <button>/<a>, which can make Playwright's normal
-    actionability wait time out even though the element is genuinely there and
-    clickable. Returns False (after logging) only if all three fail. Also logs which
-    element/method actually fired and which selector matched it -- a click can
-    "succeed" against the wrong element entirely if the locator matched more than
-    one thing or matched something decorative, so that's worth being able to see."""
+    """Tries a raw JS .click() FIRST, then a normal click, then a forced click.
+    FedEx serves this script a MOBILE layout (ice.mobi.* handlers) where several
+    controls sit outside the viewport -- a real (coordinate-based) click, forced or
+    not, can silently land nowhere on an off-screen element, while el.click() calls
+    the element's own click handler directly regardless of position or visibility,
+    which is both more reliable here and avoids scrolling tricks. The two
+    coordinate-based clicks are kept only as a fallback in case a handler relies on
+    real mouse-event properties the JS method doesn't set. Returns False (after
+    logging) only if all three fail. Also logs which element actually matched --
+    a click can "succeed" against the wrong element if the locator matched more
+    than one thing or something decorative."""
     try:
         info = locator.evaluate(
             "el => ({tag: el.tagName, id: el.id, type: el.type || null, "
@@ -282,20 +284,20 @@ def robust_click(locator, log, description: str) -> bool:
 
     err1 = err2 = err3 = None
     try:
-        locator.click(timeout=8000)
-        log(f"Clicked {description} normally.")
+        locator.evaluate("el => el.click()")
+        log(f"Clicked {description} via raw JS el.click().")
         return True
     except Exception as e:
         err1 = repr(e)
     try:
-        locator.click(timeout=4000, force=True)
-        log(f"Clicked {description} with force=True (normal click failed: {err1}).")
+        locator.click(timeout=8000)
+        log(f"Clicked {description} normally (JS click failed: {err1}).")
         return True
     except Exception as e:
         err2 = repr(e)
     try:
-        locator.evaluate("el => el.click()")
-        log(f"Clicked {description} via raw JS el.click() (both real clicks failed: "
+        locator.click(timeout=4000, force=True)
+        log(f"Clicked {description} with force=True (JS and normal both failed: "
             f"{err1}, {err2}).")
         return True
     except Exception as e:
@@ -598,20 +600,13 @@ def run_once(headless: bool, dry_run: bool) -> int:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        # Force a plain desktop viewport + user-agent. Live runs showed FedEx serving
-        # a MOBILE layout instead (onclick handlers under "ice.mobi.*", elements sitting
-        # off to the side needing a scroll) -- almost certainly because Playwright's
-        # default headless Chromium reports "HeadlessChrome" in its user-agent, which
-        # some sites detect and respond to with a simplified/mobile UI. A real desktop
-        # UA plus a generous viewport should get the same interface a human sees.
-        ctx_kwargs = {
-            "accept_downloads": True,
-            "viewport": {"width": 1600, "height": 1000},
-            "user_agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-            ),
-        }
+        # FedEx serves a MOBILE layout to this script (onclick handlers under
+        # "ice.mobi.*") -- forcing a desktop UA/viewport was tried and made things
+        # worse (the content pane stopped rendering within any reasonable wait), so
+        # that's reverted. The mobile layout itself renders content fine; the only
+        # real problem was clicking elements that sit off-screen, which robust_click
+        # now handles by trying a coordinate-free JS click first (see below).
+        ctx_kwargs = {"accept_downloads": True}
         if STORAGE_STATE_PATH.exists():
             ctx_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
         ctx = browser.new_context(**ctx_kwargs)
