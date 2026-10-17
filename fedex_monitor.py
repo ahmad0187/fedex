@@ -47,6 +47,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -596,9 +597,69 @@ def export_and_download(page, log, ctx=None) -> Path | None:
 
 # ---------------------------------------------------------------------------- cycle
 
-def run_once(headless: bool, dry_run: bool) -> int:
+def process_manifest(fcc_page, ctx, log, dry_run: bool) -> bool:
+    """Runs one real check (export -> risk scan -> Slack alerts) against an
+    already-logged-in, already-searched Pickup Manifest page. Shared by run_once
+    (which only ever does this once) and run_watch (which calls it repeatedly on the
+    same session). Returns False only when something about the page itself looks
+    broken -- callers treat that as 'this session probably needs a fresh login' --
+    not when there's simply nothing to export (that's a normal, healthy outcome)."""
     now = datetime.now(STATION_TZ)
     now_iso = now.isoformat()
+
+    try:
+        xls_path = export_and_download(fcc_page, log, ctx=ctx)
+    except Exception as e:
+        log(f"export_and_download raised an error (treating as a dead session): {e!r}")
+        ping_healthcheck(log, ok=False)
+        return False
+
+    if xls_path is None:
+        log("No export captured this cycle (could genuinely be zero open pickups "
+            "right now, or the export control needs a one-line selector fix -- see "
+            "any message above).")
+        ping_healthcheck(log, ok=True)
+        return True
+
+    log(f"Downloaded {xls_path.name}")
+
+    df = load_manifest(xls_path)
+    risky = find_at_risk(df, now=now, warn_minutes=WARN_MINUTES, manifest_day=now)
+    log(f"{len(risky)} stop(s) currently within the {WARN_MINUTES}-minute warning window.")
+
+    conn = db_connect()
+    to_send = filter_new_or_escalated(conn, risky, now_iso)
+    conn.close()
+
+    for stop in to_send:
+        send_slack(format_alert(stop), dry_run=dry_run)
+    log(f"Sent {len(to_send)} new/escalated Slack alert(s).")
+    ping_healthcheck(log, ok=True)
+    return True
+
+
+def keepalive_probe(fcc_page, log) -> bool:
+    """A cheap 'are we still logged in' check for the gaps between full checks in
+    --watch mode. Re-clicking Search is the whole point, not just the test: it's
+    also what resets PeopleSoft's own server-side idle timeout, so the session stays
+    usable without a brand new Okta login every few minutes. Nothing is exported or
+    parsed here -- only process_manifest() does that."""
+    try:
+        search_btn = fcc_page.locator('input[name="manifestForm:search"]').first
+        if search_btn.count() == 0:
+            search_btn = fcc_page.get_by_role("button", name=re.compile("^Search$", re.I)).first
+        if not robust_click(search_btn, log, "the Search button (keep-alive probe)"):
+            return False
+        fcc_page.wait_for_selector("text=/records found/i", timeout=20000)
+        log("Keep-alive probe: session still alive.")
+        return True
+    except Exception as e:
+        log(f"Keep-alive probe failed (treating as a dead session): {e!r}")
+        return False
+
+
+def run_once(headless: bool, dry_run: bool) -> int:
+    now = datetime.now(STATION_TZ)
 
     def log(msg):
         # Timestamp at call time, not run_once's start time -- otherwise every line
@@ -646,37 +707,153 @@ def run_once(headless: bool, dry_run: bool) -> int:
             ping_healthcheck(log, ok=False)
             return 1
 
-        xls_path = export_and_download(fcc_page, log, ctx=ctx)
+        ok = process_manifest(fcc_page, ctx, log, dry_run)
         browser.close()
 
-        if xls_path is None:
-            log("No export captured this cycle (could genuinely be zero open pickups "
-                "right now, or the export control needs a one-line selector fix -- see "
-                "any message above).")
-            ping_healthcheck(log, ok=True)
-            return 0
+    return 0 if ok else 1
 
-        log(f"Downloaded {xls_path.name}")
 
-    df = load_manifest(xls_path)
-    risky = find_at_risk(df, now=now, warn_minutes=WARN_MINUTES, manifest_day=now)
-    log(f"{len(risky)} stop(s) currently within the {WARN_MINUTES}-minute warning window.")
+def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
+              keepalive_min: int = 2, max_consecutive_failures: int = 3) -> int:
+    """Alternative to run_once for long-running use (systemd Type=simple instead of a
+    timer firing run_once every cycle). Logs in ONCE and keeps that same browser
+    session alive for as long as it can, instead of a brand new Okta SSO handshake
+    every 10-15 minutes:
+      - every `keepalive_min` minutes: a cheap keep-alive probe (re-click Search,
+        nothing exported) that also resets PeopleSoft's own idle timeout.
+      - every `full_interval_min` minutes: the real check (export, risk scan, Slack
+        alerts) via process_manifest(), same logic run_once uses.
+    A fresh login only happens when a probe or full check finds the session actually
+    dead -- not on a fixed schedule -- so a login that was flaky with the old
+    every-cycle approach gets far fewer chances to land on whatever FedEx-side
+    variance (mobile vs. desktop UI, F5 interstitial, etc.) causes that flakiness.
+    After `max_consecutive_failures` dead-session logins in a row, gives up and
+    exits non-zero so systemd (Restart=always) starts over with a clean browser."""
+    def log(msg):
+        print(f"[{datetime.now(STATION_TZ):%Y-%m-%d %H:%M:%S %Z}] {msg}")
 
-    conn = db_connect()
-    to_send = filter_new_or_escalated(conn, risky, now_iso)
-    conn.close()
+    have_creds = bool(os.environ.get("FEDEX_USERNAME")) and bool(os.environ.get("FEDEX_PASSWORD"))
+    if not STORAGE_STATE_PATH.exists() and not have_creds:
+        log(f"Neither {STORAGE_STATE_PATH.name} nor FEDEX_USERNAME/FEDEX_PASSWORD are "
+            "set -- run fedex_login.py once locally (saved-session mode), or set "
+            "those two env vars / secrets (auto-login mode).")
+        return 1
 
-    for stop in to_send:
-        send_slack(format_alert(stop), dry_run=dry_run)
-    log(f"Sent {len(to_send)} new/escalated Slack alert(s).")
-    ping_healthcheck(log, ok=True)
-    return 0
+    DOWNLOAD_DIR.mkdir(exist_ok=True)
+    full_interval = timedelta(minutes=full_interval_min)
+    keepalive_interval = timedelta(minutes=keepalive_min)
+    consecutive_failures = 0
+
+    def send_failure_alert(reason):
+        conn = db_connect()
+        if should_send_failure_alert(conn, datetime.now(STATION_TZ)):
+            msg = ("⚠️ FedEx Pickup Manifest check failed this cycle"
+                   + (" -- saved login session has expired, needs a fresh login."
+                      if reason == "LOGGED_OUT" else
+                      " -- see service logs for details.")
+                   + " (this alert is sent at most once every "
+                   f"{FAILURE_ALERT_COOLDOWN_MIN} minutes while it stays broken)")
+            send_slack(msg, dry_run=dry_run)
+        conn.close()
+        ping_healthcheck(log, ok=False)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        ctx = None
+
+        def login(close_old: bool):
+            nonlocal ctx
+            if close_old and ctx is not None:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+            ctx_kwargs = {"accept_downloads": True}
+            if STORAGE_STATE_PATH.exists():
+                ctx_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
+            ctx = browser.new_context(**ctx_kwargs)
+            page = ctx.new_page()
+            result = goto_pickup_manifest(ctx, page, log)
+            if result in (None, "LOGGED_OUT"):
+                return None, result
+            return result, None
+
+        try:
+            fcc_page, fail_reason = login(close_old=False)
+            if fcc_page is None:
+                send_failure_alert(fail_reason)
+                return 1
+
+            next_full = datetime.now(STATION_TZ)  # run a full check right away
+            next_keepalive = datetime.now(STATION_TZ) + keepalive_interval
+            log(f"Watch mode started: full check every {full_interval_min} min, "
+                f"keep-alive probe every {keepalive_min} min.")
+
+            while True:
+                now = datetime.now(STATION_TZ)
+                healthy = True
+
+                if now >= next_full:
+                    log("-- full check --")
+                    healthy = process_manifest(fcc_page, ctx, log, dry_run)
+                    if healthy:
+                        next_full = now + full_interval
+                        next_keepalive = now + keepalive_interval
+                elif now >= next_keepalive:
+                    log("-- keep-alive probe --")
+                    healthy = keepalive_probe(fcc_page, log)
+                    if healthy:
+                        next_keepalive = now + keepalive_interval
+
+                if not healthy:
+                    log("Session looks dead -- logging back in from scratch (this is "
+                        "the only time a fresh Okta login happens in --watch mode).")
+                    fcc_page, fail_reason = login(close_old=True)
+                    if fcc_page is None:
+                        consecutive_failures += 1
+                        send_failure_alert(fail_reason)
+                        if consecutive_failures >= max_consecutive_failures:
+                            log(f"{consecutive_failures} re-logins in a row failed -- "
+                                "exiting so the service restarts with a clean browser.")
+                            return 1
+                        time.sleep(60)
+                        continue
+                    consecutive_failures = 0
+                    next_full = datetime.now(STATION_TZ)
+                    next_keepalive = datetime.now(STATION_TZ) + keepalive_interval
+                    continue
+
+                time.sleep(15)
+        finally:
+            if ctx is not None:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+            browser.close()
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--headful", action="store_true", help="show the browser window for this run")
     ap.add_argument("--dry-run", action="store_true", help="print alerts instead of posting to Slack")
+    ap.add_argument("--watch", action="store_true",
+                     help="log in once and keep running: a full check every "
+                          "--full-interval minutes, with cheap keep-alive Search "
+                          "clicks every --keepalive-interval minutes in between, "
+                          "instead of a brand new Okta login every cycle")
+    ap.add_argument("--full-interval", type=int, default=15,
+                     help="minutes between full checks in --watch mode (default: 15)")
+    ap.add_argument("--keepalive-interval", type=int, default=2,
+                     help="minutes between keep-alive Search clicks in --watch mode (default: 2)")
+    ap.add_argument("--max-failures", type=int, default=3,
+                     help="consecutive failed re-logins in --watch mode before giving "
+                          "up and exiting (default: 3)")
     args = ap.parse_args()
 
+    if args.watch:
+        sys.exit(run_watch(dry_run=args.dry_run, headless=not args.headful,
+                            full_interval_min=args.full_interval,
+                            keepalive_min=args.keepalive_interval,
+                            max_consecutive_failures=args.max_failures))
     sys.exit(run_once(headless=not args.headful, dry_run=args.dry_run))
