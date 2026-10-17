@@ -477,6 +477,17 @@ def goto_pickup_manifest(ctx, page, log):
     except PWTimeout:
         log("Timed out waiting for the Pickup Manifest form to render after clicking "
             f"the tab. Page text so far: {fcc_page.locator('body').inner_text()[:500]!r}")
+        # This exact failure has repeated many times (2026-10-17) with no change in
+        # the text dumps -- a screenshot might show something the text alone can't
+        # (a CAPTCHA, an F5/WAF block page, a maintenance notice, a blank page, etc.).
+        # Overwrites the same file each time on purpose -- only the latest occurrence
+        # matters for this.
+        try:
+            shot_path = HERE / "debug_stuck_render.png"
+            fcc_page.screenshot(path=str(shot_path), full_page=True)
+            log(f"Saved a screenshot of the stuck page to {shot_path}")
+        except Exception as e:
+            log(f"Could not capture a debug screenshot: {e!r}")
 
     # Work Area -> ALL (it's usually the default, but set it explicitly).
     wa_ok = False
