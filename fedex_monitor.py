@@ -487,6 +487,21 @@ def goto_pickup_manifest(ctx, page, log):
     except Exception as e:
         log(f"Could not explicitly set Work Area to ALL (leaving default): {e!r}")
 
+    # Diagnostic only (no behavior change): the script has never actually set the Date
+    # field -- the docstring assumed it defaults to today, but that's never been
+    # confirmed, and an error-styled "No results match your search request" (seen
+    # 2026-10-17) is exactly what a stale/blank/wrong Date would produce. Logging
+    # whatever it holds right now, so the next time that happens we can tell a real
+    # empty manifest apart from a bad default without guessing.
+    try:
+        date_fields = fcc_page.locator('input[id*="date" i], input[name*="date" i]').evaluate_all(
+            "els => els.map(e => ({id: e.id, name: e.name, value: e.value}))"
+        )
+        if date_fields:
+            log(f"Date field(s) on the form right now: {date_fields}")
+    except Exception:
+        pass
+
     # Click Search -- confirmed live as id="manifestForm:search", so target that
     # directly instead of relying only on a generic role/name search.
     search_btn = fcc_page.locator('input[name="manifestForm:search"]').first
