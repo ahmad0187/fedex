@@ -637,25 +637,29 @@ def process_manifest(fcc_page, ctx, log, dry_run: bool) -> bool:
 
     if xls_path is None:
         # "No export button found" is ambiguous on its own -- it's the normal, healthy
-        # shape of a genuinely empty manifest (FedEx shows "0 records found" and no
-        # export control), but it's ALSO exactly what a stuck/broken render looks like
-        # (Search got clicked but the results pane never actually came up -- the
-        # original failure mode this was built to catch). The "...records found" text
-        # is what tells the two apart: if it's nowhere on the page, this wasn't a real
-        # answer from FedEx, so don't call it healthy.
+        # shape of a genuinely empty manifest, but it's ALSO exactly what a stuck/
+        # broken render looks like (Search got clicked but the results pane never
+        # actually came up -- the original failure mode this was built to catch).
+        # Confirmed live: FedEx's "nothing matched" wording isn't consistent --
+        # "0 records found" sometimes, "No results match your search request" other
+        # times (seen 2026-10-17) -- so don't match either phrase specifically. What's
+        # actually reliable is whether the manifestForm itself is still on the page:
+        # that's only there once the tab has genuinely rendered, regardless of which
+        # wording FedEx used for an empty result.
         looks_rendered = False
         try:
-            looks_rendered = fcc_page.locator("text=/records found/i").count() > 0
+            looks_rendered = fcc_page.locator('input[name="manifestForm:search"]').count() > 0
         except Exception:
             pass
         if looks_rendered:
-            log("No export captured this cycle (0 records found, or the export "
-                "control needs a one-line selector fix -- see any message above).")
+            log("No export captured this cycle (0 results for this search, or the "
+                "export control needs a one-line selector fix -- see any message "
+                "above).")
             ping_healthcheck(log, ok=True)
             return True
-        log("No export AND no '...records found' text anywhere on the page -- this "
-            "looks like a stuck/broken render (columns never came up), not a "
-            "genuinely empty manifest. Treating this session as dead.")
+        log("No export AND the manifest form itself isn't on the page anymore -- "
+            "this looks like a stuck/broken render (columns never came up), not a "
+            "genuine answer from FedEx. Treating this session as dead.")
         ping_healthcheck(log, ok=False)
         return False
 
