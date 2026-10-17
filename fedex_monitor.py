@@ -67,6 +67,27 @@ STATION_TZ = ZoneInfo("America/New_York")
 WARN_MINUTES = 60
 FAILURE_ALERT_COOLDOWN_MIN = 120  # don't spam Slack more than once every 2h on failure
 
+# Pickups only happen in this window -- --watch mode logs out and goes fully idle
+# (no FedEx traffic at all, not even a keep-alive click) outside it, and logs back in
+# right at the start of the next window. Only read by run_watch(); run_once() always
+# runs when called, so a plain cron/systemd-timer setup controls its own hours via
+# OnCalendar/schedule instead.
+ACTIVE_WINDOW_START_HOUR = 8   # 8:00 AM Delaware time
+ACTIVE_WINDOW_END_HOUR = 20    # 8:00 PM Delaware time (exclusive)
+
+
+def _next_active_window_start(now: datetime) -> datetime:
+    """If `now` is already inside the active window, returns `now` unchanged.
+    Otherwise returns the next moment the window opens (today's or tomorrow's
+    ACTIVE_WINDOW_START_HOUR)."""
+    start_today = now.replace(hour=ACTIVE_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
+    end_today = now.replace(hour=ACTIVE_WINDOW_END_HOUR, minute=0, second=0, microsecond=0)
+    if now < start_today:
+        return start_today
+    if now >= end_today:
+        return start_today + timedelta(days=1)
+    return now
+
 HOMEPAGE_URL = "https://mybizaccount.fedex.com/"
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 # Optional: a healthchecks.io (or similar) ping URL. Pinged once per run -- the plain
@@ -779,6 +800,15 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
             return result, None
 
         try:
+            now = datetime.now(STATION_TZ)
+            window_start = _next_active_window_start(now)
+            if window_start > now:
+                wait_s = (window_start - now).total_seconds()
+                log(f"Outside the {ACTIVE_WINDOW_START_HOUR}:00-{ACTIVE_WINDOW_END_HOUR}:00 "
+                    f"{now:%Z} active window -- not logging in; idle for "
+                    f"{wait_s / 60:.0f} min until it opens.")
+                time.sleep(wait_s)
+
             fcc_page, fail_reason = login(close_old=False)
             if fcc_page is None:
                 send_failure_alert(fail_reason)
@@ -787,10 +817,40 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
             next_full = datetime.now(STATION_TZ)  # run a full check right away
             next_keepalive = datetime.now(STATION_TZ) + keepalive_interval
             log(f"Watch mode started: full check every {full_interval_min} min, "
-                f"keep-alive probe every {keepalive_min} min.")
+                f"keep-alive probe every {keepalive_min} min, active "
+                f"{ACTIVE_WINDOW_START_HOUR}:00-{ACTIVE_WINDOW_END_HOUR}:00 {now:%Z}.")
 
             while True:
                 now = datetime.now(STATION_TZ)
+
+                if now.hour >= ACTIVE_WINDOW_END_HOUR or now.hour < ACTIVE_WINDOW_START_HOUR:
+                    log(f"End of the active window ({ACTIVE_WINDOW_START_HOUR}:00-"
+                        f"{ACTIVE_WINDOW_END_HOUR}:00 {now:%Z}) -- logging out and "
+                        "going idle until it reopens (no FedEx traffic at all while idle).")
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    ctx, fcc_page = None, None
+                    window_start = _next_active_window_start(now)
+                    wait_s = (window_start - now).total_seconds()
+                    time.sleep(max(wait_s, 0))
+
+                    fcc_page, fail_reason = login(close_old=False)
+                    if fcc_page is None:
+                        consecutive_failures += 1
+                        send_failure_alert(fail_reason)
+                        if consecutive_failures >= max_consecutive_failures:
+                            log(f"{consecutive_failures} re-logins in a row failed -- "
+                                "exiting so the service restarts with a clean browser.")
+                            return 1
+                        time.sleep(60)
+                        continue
+                    consecutive_failures = 0
+                    next_full = datetime.now(STATION_TZ)
+                    next_keepalive = datetime.now(STATION_TZ) + keepalive_interval
+                    continue
+
                 healthy = True
 
                 if now >= next_full:
