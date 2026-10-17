@@ -489,29 +489,11 @@ def goto_pickup_manifest(ctx, page, log):
         except Exception as e:
             log(f"Could not capture a debug screenshot: {e!r}")
 
-    # Work Area -> ALL (it's usually the default, but set it explicitly).
-    wa_ok = False
-    try:
-        wa = fcc_page.locator("select").filter(has_text="ALL").first
-        wa.select_option(label="ALL")
-        wa_ok = True
-    except Exception as e:
-        log(f"Could not explicitly set Work Area to ALL (leaving default): {e!r}")
-
-    # Diagnostic only (no behavior change): the script has never actually set the Date
-    # field -- the docstring assumed it defaults to today, but that's never been
-    # confirmed, and an error-styled "No results match your search request" (seen
-    # 2026-10-17) is exactly what a stale/blank/wrong Date would produce. Logging
-    # whatever it holds right now, so the next time that happens we can tell a real
-    # empty manifest apart from a bad default without guessing.
-    try:
-        date_fields = fcc_page.locator('input[id*="date" i], input[name*="date" i]').evaluate_all(
-            "els => els.map(e => ({id: e.id, name: e.name, value: e.value}))"
-        )
-        if date_fields:
-            log(f"Date field(s) on the form right now: {date_fields}")
-    except Exception:
-        pass
+    # Work Area and Date are BOTH confirmed live (screenshot, 2026-10-17) to already
+    # default to ALL / today on their own -- the script used to spend up to 30s per
+    # attempt explicitly re-setting Work Area to "ALL" for no reason, which also
+    # timed out on nearly every run today. Removed entirely: nothing left to set
+    # before Search, so go straight to clicking it.
 
     # Click Search -- confirmed live as id="manifestForm:search", so target that
     # directly instead of relying only on a generic role/name search.
@@ -519,7 +501,7 @@ def goto_pickup_manifest(ctx, page, log):
     if search_btn.count() == 0:
         search_btn = fcc_page.get_by_role("button", name=re.compile("^Search$", re.I)).first
     search_ok = robust_click(search_btn, log, "the Search button")
-    log(f"Work Area set ok={wa_ok}; clicked Search ok={search_ok}.")
+    log(f"Clicked Search ok={search_ok}.")
     if not search_ok:
         log(f"URL: {fcc_page.url!r}, title: {fcc_page.title()!r}. Buttons visible: "
             + str(fcc_page.get_by_role("button").all_text_contents())
