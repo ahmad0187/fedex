@@ -636,11 +636,28 @@ def process_manifest(fcc_page, ctx, log, dry_run: bool) -> bool:
         return False
 
     if xls_path is None:
-        log("No export captured this cycle (could genuinely be zero open pickups "
-            "right now, or the export control needs a one-line selector fix -- see "
-            "any message above).")
-        ping_healthcheck(log, ok=True)
-        return True
+        # "No export button found" is ambiguous on its own -- it's the normal, healthy
+        # shape of a genuinely empty manifest (FedEx shows "0 records found" and no
+        # export control), but it's ALSO exactly what a stuck/broken render looks like
+        # (Search got clicked but the results pane never actually came up -- the
+        # original failure mode this was built to catch). The "...records found" text
+        # is what tells the two apart: if it's nowhere on the page, this wasn't a real
+        # answer from FedEx, so don't call it healthy.
+        looks_rendered = False
+        try:
+            looks_rendered = fcc_page.locator("text=/records found/i").count() > 0
+        except Exception:
+            pass
+        if looks_rendered:
+            log("No export captured this cycle (0 records found, or the export "
+                "control needs a one-line selector fix -- see any message above).")
+            ping_healthcheck(log, ok=True)
+            return True
+        log("No export AND no '...records found' text anywhere on the page -- this "
+            "looks like a stuck/broken render (columns never came up), not a "
+            "genuinely empty manifest. Treating this session as dead.")
+        ping_healthcheck(log, ok=False)
+        return False
 
     log(f"Downloaded {xls_path.name}")
 
@@ -781,6 +798,7 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         ctx = None
+        fcc_page = None
 
         def login(close_old: bool):
             nonlocal ctx
@@ -799,6 +817,28 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
                 return None, result
             return result, None
 
+        def login_with_retries(close_old: bool) -> bool:
+            """Tries to log in, retrying up to max_consecutive_failures times (60s
+            apart) before giving up -- the SAME resilience a mid-day session death
+            already gets, applied here too so one bad render right at window-open
+            doesn't take the whole day down on a single failed attempt."""
+            nonlocal fcc_page, consecutive_failures
+            for attempt in range(1, max_consecutive_failures + 1):
+                fcc_page, fail_reason = login(close_old=close_old)
+                if fcc_page is not None:
+                    consecutive_failures = 0
+                    return True
+                consecutive_failures += 1
+                send_failure_alert(fail_reason)
+                if attempt < max_consecutive_failures:
+                    log(f"Login attempt {attempt}/{max_consecutive_failures} failed -- "
+                        "retrying in 60s.")
+                    time.sleep(60)
+                close_old = True  # clean up the failed attempt's own context before retrying
+            log(f"{max_consecutive_failures} login attempts in a row failed -- "
+                "giving up for now.")
+            return False
+
         try:
             now = datetime.now(STATION_TZ)
             window_start = _next_active_window_start(now)
@@ -809,9 +849,10 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
                     f"{wait_s / 60:.0f} min until it opens.")
                 time.sleep(wait_s)
 
-            fcc_page, fail_reason = login(close_old=False)
-            if fcc_page is None:
-                send_failure_alert(fail_reason)
+            if not login_with_retries(close_old=False):
+                # Every attempt failed -- exit non-zero so systemd (Restart=always)
+                # starts the whole process over with a clean browser rather than
+                # looping forever inside one already-struggling run.
                 return 1
 
             next_full = datetime.now(STATION_TZ)  # run a full check right away
@@ -836,17 +877,8 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
                     wait_s = (window_start - now).total_seconds()
                     time.sleep(max(wait_s, 0))
 
-                    fcc_page, fail_reason = login(close_old=False)
-                    if fcc_page is None:
-                        consecutive_failures += 1
-                        send_failure_alert(fail_reason)
-                        if consecutive_failures >= max_consecutive_failures:
-                            log(f"{consecutive_failures} re-logins in a row failed -- "
-                                "exiting so the service restarts with a clean browser.")
-                            return 1
-                        time.sleep(60)
-                        continue
-                    consecutive_failures = 0
+                    if not login_with_retries(close_old=False):
+                        return 1
                     next_full = datetime.now(STATION_TZ)
                     next_keepalive = datetime.now(STATION_TZ) + keepalive_interval
                     continue
@@ -868,17 +900,8 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
                 if not healthy:
                     log("Session looks dead -- logging back in from scratch (this is "
                         "the only time a fresh Okta login happens in --watch mode).")
-                    fcc_page, fail_reason = login(close_old=True)
-                    if fcc_page is None:
-                        consecutive_failures += 1
-                        send_failure_alert(fail_reason)
-                        if consecutive_failures >= max_consecutive_failures:
-                            log(f"{consecutive_failures} re-logins in a row failed -- "
-                                "exiting so the service restarts with a clean browser.")
-                            return 1
-                        time.sleep(60)
-                        continue
-                    consecutive_failures = 0
+                    if not login_with_retries(close_old=True):
+                        return 1
                     next_full = datetime.now(STATION_TZ)
                     next_keepalive = datetime.now(STATION_TZ) + keepalive_interval
                     continue
