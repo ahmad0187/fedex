@@ -55,7 +55,7 @@ from zoneinfo import ZoneInfo
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-from pickup_risk import load_manifest, find_at_risk, format_alert
+from pickup_risk import load_manifest, find_at_risk, format_alert, format_alert_blocks
 
 HERE = Path(__file__).resolve().parent
 STORAGE_STATE_PATH = HERE / "storage_state.json"
@@ -182,11 +182,17 @@ def should_send_failure_alert(conn: sqlite3.Connection, now: datetime) -> bool:
 
 # ------------------------------------------------------------------------------ slack
 
-def send_slack(text: str, dry_run: bool = False) -> None:
+def send_slack(text: str, dry_run: bool = False, blocks: list[dict] | None = None) -> None:
+    """text is always sent as Slack's required 'fallback' (shown in notifications/
+    previews, and the whole message if blocks is omitted). blocks, when given, is
+    the actual rich Block Kit layout rendered in the channel."""
     if dry_run or not SLACK_WEBHOOK_URL:
         print("[dry-run / no SLACK_WEBHOOK_URL set] would post to Slack:\n" + text + "\n")
         return
-    resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
+    payload = {"text": text}
+    if blocks:
+        payload["blocks"] = blocks
+    resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=15)
     if resp.status_code >= 300:
         print(f"Slack post failed ({resp.status_code}): {resp.text}", file=sys.stderr)
 
@@ -685,7 +691,7 @@ def process_manifest(fcc_page, ctx, log, dry_run: bool) -> bool:
     conn.close()
 
     for stop in to_send:
-        send_slack(format_alert(stop), dry_run=dry_run)
+        send_slack(format_alert(stop), dry_run=dry_run, blocks=format_alert_blocks(stop))
     log(f"Sent {len(to_send)} new/escalated Slack alert(s).")
     ping_healthcheck(log, ok=True)
     return True

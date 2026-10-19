@@ -125,6 +125,9 @@ def find_at_risk(df: pd.DataFrame, now: datetime, warn_minutes: float = 60.0,
 
 
 def format_alert(stop: RiskyStop) -> str:
+    """Plain-text version -- used as the Slack notification's required fallback
+    'text' (shown in previews/notifications where blocks don't render) and as the
+    --dry-run printout. format_alert_blocks() below is the actual rich message."""
     icon = "⛔ PAST CLOSE" if stop.status == "PAST_CLOSE" else "🟠 PICKUP AT RISK"
     when = stop.close.strftime("%I:%M %p").lstrip("0")
     if stop.status == "PAST_CLOSE":
@@ -138,3 +141,33 @@ def format_alert(stop: RiskyStop) -> str:
     if stop.address:
         lines.append(f"📍 {stop.address}")
     return "\n".join(lines)
+
+
+def format_alert_blocks(stop: RiskyStop) -> list[dict]:
+    """Slack Block Kit version: a 2-column Metric/Value table (Alert Level, Account,
+    Station ID, Address, Cutoff Time, Time Remaining, System Flag), matching the
+    layout requested 2026-10-19. 'Account' is the Shipper Name column off the
+    manifest -- FedEx's own term for the customer on that stop (e.g. "Dollar
+    General"), not a billing/FedEx-account-number field."""
+    alert_level = "⛔ Past Close" if stop.status == "PAST_CLOSE" else "🟠 At Risk"
+    cutoff = stop.close.strftime("%I:%M %p").lstrip("0")
+    if stop.status == "PAST_CLOSE":
+        time_remaining = f"Past close by {abs(stop.minutes_to_close):.0f} min"
+    else:
+        time_remaining = f"{stop.minutes_to_close:.0f} minutes"
+
+    def field(label: str, value: str) -> dict:
+        return {"type": "mrkdwn", "text": f"*{label}*\n{value}"}
+
+    return [{
+        "type": "section",
+        "fields": [
+            field("Alert Level", alert_level),
+            field("Account", stop.shipper_name or "Unknown"),
+            field("Station ID", f"{stop.station} (WA {stop.wa})"),
+            field("Address", stop.address or "N/A"),
+            field("Cutoff Time", cutoff),
+            field("Time Remaining", time_remaining),
+            field("System Flag", "No pickup closed / No reason on file"),
+        ],
+    }]
