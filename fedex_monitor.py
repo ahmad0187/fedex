@@ -566,14 +566,17 @@ def export_and_download(page, log, ctx=None) -> Path | None:
     # rendering than a fixed short sleep -- wait for the actual export control to
     # show up rather than guessing a delay, before trying anything else.
     try:
-        page.wait_for_selector('input[name="manifestForm:buttonGenerateExcel"]', timeout=25000)
+        page.wait_for_selector('[id="manifestForm:buttonGenerateExcel"]', timeout=25000)
     except PWTimeout:
         pass  # fall through to dismiss_popups/candidates/diagnostics below either way
 
     dismiss_popups(page, log)
-    # Confirmed live: it's `<input type="image" id="manifestForm:buttonGenerateExcel">`,
-    # not a normal button/link -- that's tried first; the rest are fallbacks only.
+    # Confirmed live: it's `<input type="image" id="manifestForm:buttonGenerateExcel">`.
+    # The id is the one actually confirmed live -- id and name usually match on a JSF/
+    # PrimeFaces component like this, but that was never directly confirmed, so the id
+    # selector goes first and the name-based one stays only as a fallback.
     candidates = [
+        lambda: page.locator('[id="manifestForm:buttonGenerateExcel"]').first,
         lambda: page.locator('input[name="manifestForm:buttonGenerateExcel"]').first,
         lambda: page.locator('input[type="image"][src*="excel" i]').first,
         lambda: page.get_by_role("link", name=re.compile("excel|export", re.I)).first,
