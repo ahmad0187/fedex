@@ -802,14 +802,29 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
     full_interval = timedelta(minutes=full_interval_min)
     keepalive_interval = timedelta(minutes=keepalive_min)
     consecutive_failures = 0
+    # Tracks full-check failures that happen AFTER a successful login (export stuck /
+    # columns never render) -- separate from login failures above, because those were
+    # already alerted on but this case previously was not: login can keep succeeding
+    # while Search/export keeps failing, which looped silently forever with zero Slack
+    # alert. EXPORT_STUCK_ALERT_THRESHOLD full checks in a row (not counting keep-alive
+    # probes) is enough to rule out a one-off FedEx blip before paging the user.
+    EXPORT_STUCK_ALERT_THRESHOLD = 2
+    consecutive_export_failures = 0
+    today_confirmed_date = None  # date() of the last "today's check is live" ping sent
 
     def send_failure_alert(reason):
         conn = db_connect()
         if should_send_failure_alert(conn, datetime.now(STATION_TZ)):
-            msg = ("⚠️ FedEx Pickup Manifest check failed this cycle"
-                   + (" -- saved login session has expired, needs a fresh login."
-                      if reason == "LOGGED_OUT" else
-                      " -- see service logs for details.")
+            if reason == "LOGGED_OUT":
+                detail = " -- saved login session has expired, needs a fresh login."
+            elif reason == "EXPORT_STUCK":
+                detail = (" -- logged in fine, but Search/Excel export keeps failing to "
+                           "render even after re-login (this looks like the FedEx page "
+                           "itself getting stuck, not a login problem). See "
+                           "debug_stuck_render.png and the service logs on the server.")
+            else:
+                detail = " -- see service logs for details."
+            msg = ("⚠️ FedEx Pickup Manifest check failed this cycle" + detail
                    + " (this alert is sent at most once every "
                    f"{FAILURE_ALERT_COOLDOWN_MIN} minutes while it stays broken)")
             send_slack(msg, dry_run=dry_run)
@@ -910,8 +925,19 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
                     log("-- full check --")
                     healthy = process_manifest(fcc_page, ctx, log, dry_run)
                     if healthy:
+                        consecutive_export_failures = 0
                         next_full = now + full_interval
                         next_keepalive = now + keepalive_interval
+                        if today_confirmed_date != now.date():
+                            send_slack(
+                                f"✅ FedEx Pickup Manifest check is live for today "
+                                f"({now:%Y-%m-%d}) -- logged in, Search/Excel export "
+                                "confirmed working.", dry_run=dry_run)
+                            today_confirmed_date = now.date()
+                    else:
+                        consecutive_export_failures += 1
+                        if consecutive_export_failures >= EXPORT_STUCK_ALERT_THRESHOLD:
+                            send_failure_alert("EXPORT_STUCK")
                 elif now >= next_keepalive:
                     log("-- keep-alive probe --")
                     healthy = keepalive_probe(fcc_page, log)
