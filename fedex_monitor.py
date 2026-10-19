@@ -425,7 +425,18 @@ def goto_pickup_manifest(ctx, page, log):
             log(f"Could not click through the policy page: {e!r}")
 
     fcc_page = page
-    if "cpc-mi" not in page.url:
+    # Collected from whichever page fcc_page ends up being (attached below, once we
+    # know which one that is) so a stuck-render diagnostic can show real JS errors
+    # instead of just a timeout with no explanation.
+    console_messages: list[str] = []
+
+    def _capture_console(target_page):
+        target_page.on("console", lambda m: console_messages.append(f"[{m.type}] {m.text}"))
+        target_page.on("pageerror", lambda e: console_messages.append(f"[pageerror] {e}"))
+
+    if "cpc-mi" in page.url:
+        _capture_console(fcc_page)  # already on the FCC app page, nothing more to open
+    else:
         # The homepage's tiles are each their own iframe and load asynchronously, so
         # wait for the specific one we need rather than a fixed sleep -- a headless CI
         # runner can be slower to render these than a real browser.
@@ -446,6 +457,7 @@ def goto_pickup_manifest(ctx, page, log):
             with ctx.expect_page(timeout=15000) as new_page_info:
                 frame.get_by_text(re.compile("FedEx Customer Connection", re.I)).first.click(timeout=10000)
             fcc_page = new_page_info.value
+            _capture_console(fcc_page)
             fcc_page.wait_for_load_state("domcontentloaded")
             # The new tab goes through an intermediate redirect (its title briefly
             # reads "Loading https://...") before the actual app renders -- wait for a
@@ -483,17 +495,58 @@ def goto_pickup_manifest(ctx, page, log):
     except PWTimeout:
         log("Timed out waiting for the Pickup Manifest form to render after clicking "
             f"the tab. Page text so far: {fcc_page.locator('body').inner_text()[:500]!r}")
-        # This exact failure has repeated many times (2026-10-17) with no change in
-        # the text dumps -- a screenshot might show something the text alone can't
-        # (a CAPTCHA, an F5/WAF block page, a maintenance notice, a blank page, etc.).
-        # Overwrites the same file each time on purpose -- only the latest occurrence
-        # matters for this.
+        # This exact failure has repeated many times (2026-10-17, 2026-10-19) with no
+        # change in the text dumps. A full_page screenshot turned out to be a dead
+        # end -- chrome-headless-shell (what this VPS actually runs, confirmed via
+        # `systemctl status`) is known to produce solid-black full_page screenshots
+        # when the frame is captured mid-paint, which is exactly what we got: a plain
+        # black image with no diagnostic value. Dump real DOM/HTML/console evidence
+        # instead, which headless-shell doesn't corrupt. Overwrites the same files
+        # each time on purpose -- only the latest occurrence matters for this.
         try:
-            shot_path = HERE / "debug_stuck_render.png"
-            fcc_page.screenshot(path=str(shot_path), full_page=True)
-            log(f"Saved a screenshot of the stuck page to {shot_path}")
+            html_path = HERE / "debug_stuck_render.html"
+            html_path.write_text(fcc_page.content(), encoding="utf-8")
+            log(f"Saved the page's live HTML to {html_path} ({html_path.stat().st_size} bytes)")
         except Exception as e:
-            log(f"Could not capture a debug screenshot: {e!r}")
+            log(f"Could not save debug HTML: {e!r}")
+        try:
+            iframes = fcc_page.locator("iframe").evaluate_all(
+                "els => els.map(e => ({id: e.id, title: e.title, name: e.name, "
+                "src: e.src, w: e.clientWidth, h: e.clientHeight}))")
+            log(f"iframes on the page right now: {iframes}")
+        except Exception as e:
+            log(f"Could not inspect iframes: {e!r}")
+        try:
+            scroll_info = fcc_page.locator("body").evaluate("""body => {
+                const all = [...document.querySelectorAll("*")];
+                return all.filter(el => {
+                    const s = getComputedStyle(el);
+                    return el.scrollWidth > el.clientWidth + 20 && el.clientWidth > 0 &&
+                           (s.overflowX === "auto" || s.overflowX === "scroll");
+                }).map(el => ({tag: el.tagName, id: el.id,
+                                className: String(el.className).slice(0, 120),
+                                clientWidth: el.clientWidth, scrollWidth: el.scrollWidth}))
+                .slice(0, 20);
+            }""")
+            log(f"Horizontal-scroll containers found: {scroll_info}")
+        except Exception as e:
+            log(f"Could not run the scroll-container diagnostic: {e!r}")
+        try:
+            manifest_els = fcc_page.locator(
+                '[id*="manifestForm"], [id*="GenerateExcel"], table, [role="grid"]'
+            ).evaluate_all(
+                """els => els.map(e => ({tag: e.tagName, id: e.id,
+                    visible: !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length),
+                    display: getComputedStyle(e).display})).slice(0, 50)"""
+            )
+            log(f"manifestForm/grid/export elements anywhere in the DOM (even if hidden): {manifest_els}")
+        except Exception as e:
+            log(f"Could not inspect manifestForm/grid elements: {e!r}")
+        if console_messages:
+            log(f"Browser console/page errors captured since this page loaded "
+                f"({len(console_messages)} total, showing up to 30): {console_messages[:30]}")
+        else:
+            log("No browser console or page errors were captured.")
 
     # Work Area and Date are BOTH confirmed live (screenshot, 2026-10-17) to already
     # default to ALL / today on their own -- the script used to spend up to 30s per
