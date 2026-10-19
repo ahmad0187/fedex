@@ -551,6 +551,28 @@ def goto_pickup_manifest(ctx, page, log):
         else:
             log("No browser console or page errors were captured.")
 
+        # The console diagnostics above (2026-10-19, reproduced on every attempt that
+        # day) consistently show FedEx's own ICEfaces JS logging "singleSubmit failed
+        # cannot find enclosing form" right as the tab click happens -- that's ICEfaces'
+        # click handler erroring out specifically on our *scripted* el.click() (fired
+        # via locator.evaluate("el => el.click()") in robust_click), which never
+        # throws so robust_click reports success without ever trying a real click.
+        # One retry with an actual trusted, OS-level mouse click -- a fundamentally
+        # different kind of event than a scripted one -- before giving up on this
+        # attempt entirely.
+        log("Retrying the 'P&D Manifests' tab with a real (trusted) mouse click, "
+            "since the scripted click may be what's tripping ICEfaces' handler.")
+        try:
+            pdm.click(timeout=8000)
+            log("Sent a real mouse click on the tab. Waiting again for the form...")
+            fcc_page.wait_for_selector('input[name="manifestForm:search"]', timeout=20000)
+            log("Pickup Manifest form rendered after the real-click retry.")
+        except PWTimeout:
+            log("Still timed out after the real-click retry -- treating this attempt "
+                "as a genuinely stuck render.")
+        except Exception as e:
+            log(f"Real-click retry itself failed: {e!r}")
+
     # Work Area and Date are BOTH confirmed live (screenshot, 2026-10-17) to already
     # default to ALL / today on their own -- the script used to spend up to 30s per
     # attempt explicitly re-setting Work Area to "ALL" for no reason, which also
