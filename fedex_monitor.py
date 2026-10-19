@@ -800,7 +800,12 @@ def run_once(headless: bool, dry_run: bool) -> int:
         # real problem was clicking elements that sit off-screen, which robust_click
         # now handles by trying a coordinate-free JS click first (see below).
         ctx_kwargs = {"accept_downloads": True}
-        if STORAGE_STATE_PATH.exists():
+        # Only fall back to the saved cookies when there's no username/password to do
+        # a clean login with -- see the matching comment in run_watch()'s login() for
+        # why: an old, effectively-dead storage_state.json presented alongside a fresh
+        # credential login looks like a plausible contributor to the session-collision
+        # symptoms seen 2026-10-19.
+        if not have_creds and STORAGE_STATE_PATH.exists():
             ctx_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
         ctx = browser.new_context(**ctx_kwargs)
         page = ctx.new_page()
@@ -900,7 +905,17 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
                 except Exception:
                     pass
             ctx_kwargs = {"accept_downloads": True}
-            if STORAGE_STATE_PATH.exists():
+            # Only fall back to the saved cookies when there's no username/password to
+            # do a clean login with. When FEDEX_USERNAME/PASSWORD are set (the normal
+            # case here), every attempt was ALSO loading this old, effectively-dead
+            # storage_state.json cookie on top of a fresh credential login (confirmed
+            # by the logs always showing "Automatic login succeeded" -- the saved
+            # cookie never actually skipped login, so it was never doing anything
+            # useful). Console diagnostics on 2026-10-19 caught FedEx's own JS warning
+            # about a session "cannot be shared among multiple web-contexts" right as
+            # a render got stuck -- presenting a stale old session cookie alongside a
+            # brand new login is exactly the kind of thing that could cause that.
+            if not have_creds and STORAGE_STATE_PATH.exists():
                 ctx_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
             ctx = browser.new_context(**ctx_kwargs)
             page = ctx.new_page()
