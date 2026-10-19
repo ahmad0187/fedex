@@ -64,7 +64,7 @@ STATE_DB = HERE / "state.db"
 
 # Delaware is Eastern time -- change this if your station is elsewhere.
 STATION_TZ = ZoneInfo("America/New_York")
-WARN_MINUTES = 60
+WARN_MINUTES = 120
 FAILURE_ALERT_COOLDOWN_MIN = 120  # don't spam Slack more than once every 2h on failure
 
 # Pickups only happen in this window -- --watch mode logs out and goes fully idle
