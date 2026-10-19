@@ -66,6 +66,9 @@ STATE_DB = HERE / "state.db"
 STATION_TZ = ZoneInfo("America/New_York")
 WARN_MINUTES = 120
 FAILURE_ALERT_COOLDOWN_MIN = 120  # don't spam Slack more than once every 2h on failure
+LOGIN_RETRY_BACKOFF_SEC = 120  # gap between retried logins in --watch mode (see
+# login_with_retries() -- was 60s; widened 2026-10-19 after console diagnostics
+# showed signs of a lingering server-side session colliding with the next login
 
 # Pickups only happen in this window -- --watch mode logs out and goes fully idle
 # (no FedEx traffic at all, not even a keep-alive click) outside it, and logs back in
@@ -907,10 +910,17 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
             return result, None
 
         def login_with_retries(close_old: bool) -> bool:
-            """Tries to log in, retrying up to max_consecutive_failures times (60s
-            apart) before giving up -- the SAME resilience a mid-day session death
-            already gets, applied here too so one bad render right at window-open
-            doesn't take the whole day down on a single failed attempt."""
+            """Tries to log in, retrying up to max_consecutive_failures times before
+            giving up -- the SAME resilience a mid-day session death already gets,
+            applied here too so one bad render right at window-open doesn't take the
+            whole day down on a single failed attempt.
+            Backoff between attempts (LOGIN_RETRY_BACKOFF_SEC) is deliberately longer
+            than a quick retry: console diagnostics on 2026-10-19 showed FedEx's own
+            ICEfaces JS warning "Blocking connection cannot be shared among multiple
+            web-contexts" right as a render got stuck -- i.e. the previous (failed/
+            killed) session's server-side connection hadn't fully torn down yet when
+            the next login started. Giving it more breathing room between attempts
+            reduces that collision."""
             nonlocal fcc_page, consecutive_failures
             for attempt in range(1, max_consecutive_failures + 1):
                 fcc_page, fail_reason = login(close_old=close_old)
@@ -921,8 +931,8 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
                 send_failure_alert(fail_reason)
                 if attempt < max_consecutive_failures:
                     log(f"Login attempt {attempt}/{max_consecutive_failures} failed -- "
-                        "retrying in 60s.")
-                    time.sleep(60)
+                        f"retrying in {LOGIN_RETRY_BACKOFF_SEC}s.")
+                    time.sleep(LOGIN_RETRY_BACKOFF_SEC)
                 close_old = True  # clean up the failed attempt's own context before retrying
             log(f"{max_consecutive_failures} login attempts in a row failed -- "
                 "giving up for now.")
