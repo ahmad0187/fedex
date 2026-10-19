@@ -309,6 +309,35 @@ def attempt_credential_login(page, log) -> bool:
     return True
 
 
+def attempt_logout(page, log) -> None:
+    """Best-effort sign-out before abandoning a session. ctx.close() only drops our
+    end of the TCP connection -- it never tells FedEx's PeopleSoft/ICEfaces app that
+    this session is done, so the server-side session can stay "alive" for its own
+    timeout. Console diagnostics on 2026-10-19 showed FedEx's own JS refusing a new
+    session with "Blocking connection cannot be shared among multiple web-contexts"
+    right after a day of many logins in a row without ever logging out -- one
+    plausible, well-supported contributor to that pile-up. Never raises; a missed or
+    failed logout just means the old session expires on its own timeout as before."""
+    if page is None or page.is_closed():
+        return
+    try:
+        signout = page.get_by_role("link", name=re.compile(r"sign\s*out|log\s*out", re.I)).first
+        if signout.count() == 0:
+            signout = page.locator(
+                'a:has-text("Sign Out"), a:has-text("Log Out"), '
+                'button:has-text("Sign Out"), button:has-text("Log Out")'
+            ).first
+        if signout.count() > 0:
+            signout.click(timeout=5000)
+            page.wait_for_timeout(1500)
+            log("Clicked Sign Out before abandoning this session.")
+        else:
+            log("No Sign Out control found on this page -- leaving the session to "
+                "expire on its own timeout.")
+    except Exception as e:
+        log(f"Best-effort logout failed (not fatal, continuing): {e!r}")
+
+
 def robust_click(locator, log, description: str) -> bool:
     """Tries a raw JS .click() FIRST, then a normal click, then a forced click.
     FedEx serves this script a MOBILE layout (ice.mobi.* handlers) where several
@@ -922,6 +951,7 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
         def login(close_old: bool):
             nonlocal ctx
             if close_old and ctx is not None:
+                attempt_logout(fcc_page, log)
                 try:
                     ctx.close()
                 except Exception:
@@ -1056,6 +1086,7 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
                 time.sleep(15)
         finally:
             if ctx is not None:
+                attempt_logout(fcc_page, log)
                 try:
                     ctx.close()
                 except Exception:
