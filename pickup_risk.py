@@ -23,11 +23,11 @@ import pandas as pd
 
 SHEET = "Stop Details"
 
-# Daily Manifest row order: at-risk (🟡) first since those need action soonest, then
-# past-close/overdue (🔴), then everything else (completed, or not yet in the warning
-# window) at the bottom -- so the rows needing attention stay pinned to the top of
-# the table on every re-sort instead of drifting by close time.
-_STATUS_SORT_RANK = {"warn": 0, "overdue": 1, "ok": 2}
+# Daily Manifest row order: at-risk (🟡) first since those need action soonest,
+# then past-close/overdue (🔴), then not-yet-due pending (🔵), then completed
+# (🟢) at the very bottom -- so the rows needing attention stay pinned to the
+# top of the table on every re-sort instead of drifting by close time.
+_STATUS_SORT_RANK = {"warn": 0, "overdue": 1, "pending": 2, "done": 3}
 
 # A stop's unique key on one day's manifest. PU List is the pickup-group id and PUID
 # is the line number within it (both repeat day to day), so the pair is what to
@@ -183,10 +183,15 @@ def build_daily_rows(df: pd.DataFrame, now: datetime, warn_minutes: float = 60.0
                      manifest_day: Optional[datetime] = None) -> list[dict]:
     """Every row on today's manifest (not just at-risk ones), trimmed to the
     columns the 'Daily Manifest' Slack channel wants, with a per-row status:
-      'ok'      -- plenty of time, or already closed out / reason on file
+      'done'    -- already closed out (PU Closed filled), or a reason code is
+                   on file (cancelled/nothing to track) -- nothing more to do
+      'pending' -- PU Closed empty, no reason code, but more than warn_minutes
+                   from close -- not urgent yet
       'warn'    -- PU Closed empty, no reason code, <=warn_minutes to close
       'overdue' -- PU Closed empty, no reason code, close time already passed
-    Sorted by close time so the most urgent rows are easy to scan."""
+    Sorted by status (warn, overdue, pending, done) so the rows needing
+    attention stay pinned near the top and completed ones sink to the bottom
+    -- see _STATUS_SORT_RANK below."""
     day = (manifest_day or now).date()
     rows: list[dict] = []
 
@@ -198,14 +203,21 @@ def build_daily_rows(df: pd.DataFrame, now: datetime, warn_minutes: float = 60.0
         pu_closed_blank = _is_blank(row.get("PU Closed"))
         reas_blank = _is_blank(reas_code)
 
-        status = "ok"
-        if pu_closed_blank and reas_blank and close_t is not None:
+        if not pu_closed_blank:
+            status = "done"
+        elif not reas_blank:
+            status = "done"  # cancelled / reason on file -- nothing left to track
+        elif close_t is None:
+            status = "pending"  # no close time to judge urgency by
+        else:
             close_dt = datetime.combine(day, close_t, tzinfo=now.tzinfo)
             minutes_left = (close_dt - now).total_seconds() / 60.0
             if minutes_left < 0:
                 status = "overdue"
             elif minutes_left <= warn_minutes:
                 status = "warn"
+            else:
+                status = "pending"
 
         station = row.get("Station")
         rows.append({

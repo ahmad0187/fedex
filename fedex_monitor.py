@@ -288,7 +288,7 @@ def slack_api_update(channel: str, ts: str, text: str, blocks: list[dict], dry_r
     return True
 
 
-_STATUS_ICON = {"ok": "🟢", "warn": "🟡", "overdue": "🔴"}
+_STATUS_ICON = {"warn": "🟡", "overdue": "🔴", "pending": "🔵", "done": "🟢"}
 
 
 def _chunk_table_lines(header: str, lines: list[str], max_chars: int = 2800) -> list[str]:
