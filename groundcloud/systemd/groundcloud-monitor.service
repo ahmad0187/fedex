@@ -1,0 +1,18 @@
+[Unit]
+Description=GroundCloud vs FedEx pickup reconciliation (one-shot, triggered hourly by groundcloud-monitor.timer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/fedex/groundcloud
+EnvironmentFile=/root/fedex/.env
+Environment=PYTHONUNBUFFERED=1
+# If fedex-monitor.service uses a venv (check with `systemctl cat
+# fedex-monitor.service` and compare its ExecStart path), use that SAME
+# python3 here instead of /usr/bin/python3, so this gets the already-installed
+# playwright/pandas/etc. rather than the bare system Python.
+ExecStart=/usr/bin/python3 /root/fedex/groundcloud/groundcloud_monitor.py
+
+[Install]
+WantedBy=multi-user.target

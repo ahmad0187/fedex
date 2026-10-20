@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the GroundCloud vs FedEx reconciliation hourly
+
+[Timer]
+OnCalendar=hourly
+# Run promptly after boot too if the server was down when a firing was missed.
+Persistent=true
+# Avoid landing on exactly :00 together with other hourly jobs.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

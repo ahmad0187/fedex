@@ -1,0 +1,419 @@
+"""
+GroundCloud vs FedEx Pickup Manifest reconciliation.
+
+Runs ONCE per invocation (triggered hourly by a systemd timer -- see
+systemd/groundcloud-monitor.timer in this folder). Deliberately has NO shared
+code with fedex_monitor.py/pickup_risk.py one directory up -- no imports from
+them, no shared state.db, no shared browser session -- so nothing here can
+break that service. The only thing this script reads from the FedEx side is
+the most recent .xls file FedEx's own --watch service already downloads every
+cycle into ../downloads/ (read-only), so this script never logs into FedEx
+at all -- only into GroundCloud.
+
+WHAT THIS SCRIPT DOES EACH RUN
+  1. Logs into GroundCloud (GROUNDCLOUD_USERNAME/GROUNDCLOUD_PASSWORD) -- a
+     single-page username+password form, not a multi-step SSO flow like
+     FedEx's Okta.
+  2. Goes to P&D Time Commits, opens Stop Filters, clears whatever's
+     pre-selected by default, selects "Pickups" only, applies.
+  3. Scrapes every row across every page (Address, Status, ...) -- there's no
+     Excel export button on this screen, just a paginated on-screen table, so
+     this builds the equivalent of one itself.
+  4. Loads the most recent FedEx Pickup Manifest .xls already sitting in
+     ../downloads/ for today.
+  5. Matches each GroundCloud pickup row to a FedEx manifest row by
+     normalized address (no shared ID exists between the two systems).
+  6. Flags the ONE-WAY mismatch only: GroundCloud status is Completed, but
+     the matching FedEx row's "PU Closed" is still blank. (The reverse --
+     FedEx PU Closed filled in but GroundCloud still Pending -- is NOT
+     flagged; that's a normal, expected lag, not a gap.)
+  7. Posts the result to its own Slack channel (SLACK_GC_CHANNEL) via the
+     Slack Web API, reusing the same SLACK_BOT_TOKEN the Daily Manifest
+     channel uses -- a fresh message every run (a table of flagged
+     mismatches, or a one-line all-clear), not edited in place.
+
+LIVE-VERIFIED SELECTORS: NONE YET. This was written from screenshots only --
+the sandbox this was built in has no network access to groundcloud.io to test
+against. Every DOM lookup below tries a couple of reasonable selectors and,
+on total failure, dumps what it actually found on screen instead of failing
+silently -- same pattern fedex_monitor.py uses -- so the first real run on
+the VPS should be a quick one-line selector fix, not a mystery, if anything
+doesn't match first try.
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+HERE = Path(__file__).resolve().parent
+FEDEX_DOWNLOADS_DIR = Path(os.environ.get("FEDEX_DOWNLOADS_DIR", str(HERE.parent / "downloads")))
+
+# Same assumption fedex_monitor.py makes -- Delaware is Eastern time.
+STATION_TZ = ZoneInfo("America/New_York")
+
+GC_BASE = "https://groundcloud.io"
+LOGIN_URL = f"{GC_BASE}/dashboard/login/"
+TIME_COMMITS_URL = f"{GC_BASE}/dashboard/stop_service_times/"
+
+GROUNDCLOUD_USERNAME = os.environ.get("GROUNDCLOUD_USERNAME", "")
+GROUNDCLOUD_PASSWORD = os.environ.get("GROUNDCLOUD_PASSWORD", "")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+SLACK_GC_CHANNEL = os.environ.get("SLACK_GC_CHANNEL", "")
+
+ADDRESS_MATCH_THRESHOLD = 0.85  # difflib ratio -- see match_address()
+
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now(STATION_TZ):%Y-%m-%d %H:%M:%S %Z}] {msg}")
+
+
+# --------------------------------------------------------------------- Slack
+
+def post_to_slack(text: str, blocks: list[dict], dry_run: bool) -> bool:
+    """One-shot post (chat.postMessage) -- this channel gets a fresh message
+    every run, never edited in place, so there's no ts/state to track."""
+    if dry_run or not SLACK_BOT_TOKEN or not SLACK_GC_CHANNEL:
+        print(f"[dry-run / not configured] would POST to {SLACK_GC_CHANNEL or '(no channel set)'}:\n{text}\n")
+        return False
+    resp = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        json={"channel": SLACK_GC_CHANNEL, "text": text, "blocks": blocks},
+        timeout=15,
+    )
+    data = resp.json()
+    if not data.get("ok"):
+        print(f"Slack chat.postMessage failed: {data}", file=sys.stderr)
+        return False
+    return True
+
+
+# ------------------------------------------------------------- address match
+
+_ABBR = {
+    "STREET": "ST", "ROAD": "RD", "AVENUE": "AVE", "DRIVE": "DR", "LANE": "LN",
+    "COURT": "CT", "PARKWAY": "PKWY", "BOULEVARD": "BLVD", "HIGHWAY": "HWY",
+    "PLACE": "PL", "CIRCLE": "CIR", "TRAIL": "TRL", "SUITE": "STE",
+    "APARTMENT": "APT", "BUILDING": "BLDG", "NORTH": "N", "SOUTH": "S",
+    "EAST": "E", "WEST": "W",
+}
+
+
+def normalize_address(addr: str) -> str:
+    """Uppercase, strip punctuation/zip/extra whitespace, normalize a handful
+    of common street-suffix spellings -- GroundCloud and FedEx format
+    addresses slightly differently (e.g. 'Rd' vs 'Road'), so an exact string
+    match would miss plenty of genuine matches."""
+    if not addr:
+        return ""
+    s = addr.upper()
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\b\d{5}(\d{4})?\b$", "", s)  # trailing zip / zip+4 (no dash, already stripped)
+    s = re.sub(r"\s+", " ", s).strip()
+    words = [_ABBR.get(w, w) for w in s.split()]
+    return " ".join(words)
+
+
+def match_address(gc_address: str, fedex_rows: list[dict]) -> Optional[dict]:
+    """Best fuzzy match of a GroundCloud address against every FedEx row's
+    normalized address. Returns None below ADDRESS_MATCH_THRESHOLD -- an
+    unmatched GroundCloud row is simply skipped, not flagged (per spec: only
+    flag when a FedEx match IS found and PU Closed is blank there)."""
+    gc_norm = normalize_address(gc_address)
+    if not gc_norm:
+        return None
+    best, best_ratio = None, 0.0
+    for row in fedex_rows:
+        ratio = difflib.SequenceMatcher(None, gc_norm, row["_addr_norm"]).ratio()
+        if ratio > best_ratio:
+            best, best_ratio = row, ratio
+    if best is not None and best_ratio >= ADDRESS_MATCH_THRESHOLD:
+        return best
+    return None
+
+
+# ------------------------------------------------------------- fedex import
+
+def _is_blank(v) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, float) and pd.isna(v):
+        return True
+    return str(v).strip() == ""
+
+
+def find_latest_fedex_export(now: datetime) -> Optional[Path]:
+    """FedEx's own --watch service writes manifest_YYYYMMDD_HHMMSS.xls into
+    ../downloads/ every full-check cycle (every 15 min by default) -- this
+    just picks today's most recent one. Read-only: never writes there."""
+    pattern = f"manifest_{now:%Y%m%d}_*.xls"
+    matches = sorted(FEDEX_DOWNLOADS_DIR.glob(pattern))
+    return matches[-1] if matches else None
+
+
+def load_fedex_rows(path: Path) -> list[dict]:
+    """Minimal, independent read of the same 'Stop Details' sheet
+    pickup_risk.py reads -- duplicated here on purpose (a few lines) rather
+    than imported, to keep this script's only dependency on the FedEx side
+    being the downloaded file itself, not its code."""
+    df = pd.read_excel(path, sheet_name="Stop Details", engine="xlrd", header=0)
+    df.columns = [str(c).strip() for c in df.columns]
+    rows = []
+    for _, row in df.iterrows():
+        address = ", ".join(x for x in (
+            str(row.get("Address Line 1") or "").strip(),
+            str(row.get("City") or "").strip(),
+            str(row.get("State") or "").strip(),
+        ) if x)
+        rows.append({
+            "station": row.get("Station"),
+            "shipper": str(row.get("Shipper Name") or "").strip(),
+            "address": address,
+            "pu_closed_blank": _is_blank(row.get("PU Closed")),
+            "_addr_norm": normalize_address(address),
+        })
+    return rows
+
+
+# ---------------------------------------------------------------- scraping
+
+def login(page, log) -> bool:
+    page.goto(LOGIN_URL, wait_until="domcontentloaded")
+
+    user_candidates = [
+        lambda: page.locator('input[name="username"]').first,
+        lambda: page.locator('input[type="email"]').first,
+        lambda: page.locator('input[id*="user" i]').first,
+        lambda: page.locator('input[placeholder*="user" i], input[placeholder*="email" i]').first,
+        lambda: page.locator('input[type="text"]').first,
+    ]
+    pass_candidates = [
+        lambda: page.locator('input[type="password"]').first,
+    ]
+
+    user_input = next((loc() for loc in user_candidates if loc().count() > 0), None)
+    pass_input = next((loc() for loc in pass_candidates if loc().count() > 0), None)
+
+    if user_input is None or pass_input is None:
+        _dump_visible_elements(page, log, "Could not find the username/password fields on the login page.")
+        return False
+
+    user_input.fill(GROUNDCLOUD_USERNAME)
+    pass_input.fill(GROUNDCLOUD_PASSWORD)
+
+    submit_candidates = [
+        lambda: page.get_by_role("button", name=re.compile(r"next|log\s*in|sign\s*in", re.I)).first,
+        lambda: page.locator('button[type="submit"]').first,
+    ]
+    submit = next((loc() for loc in submit_candidates if loc().count() > 0), None)
+    if submit is None:
+        _dump_visible_elements(page, log, "Could not find the login submit button.")
+        return False
+
+    submit.click()
+    try:
+        page.wait_for_url(re.compile(r"/dashboard/?(?!.*login)"), timeout=20000)
+    except PWTimeout:
+        if "/login" in page.url:
+            log(f"Still on the login page after submitting -- login failed "
+                f"(wrong credentials, or the page needs a different selector). URL: {page.url}")
+            return False
+        # Some other URL than expected but not the login page -- probably fine, keep going.
+    log(f"Logged into GroundCloud. Landed on: {page.url}")
+    return True
+
+
+def apply_pickups_filter(page, log) -> bool:
+    page.goto(TIME_COMMITS_URL, wait_until="domcontentloaded")
+    if "/login" in page.url:
+        log("Redirected back to login when opening P&D Time Commits -- session isn't valid.")
+        return False
+
+    filters_btn = page.get_by_role("button", name=re.compile(r"stop filters", re.I)).first
+    if filters_btn.count() == 0:
+        _dump_visible_elements(page, log, "Could not find the 'Stop Filters' button.")
+        return False
+    filters_btn.click()
+
+    try:
+        page.wait_for_selector("text=/stop filters/i", timeout=10000)
+    except PWTimeout:
+        log("Stop Filters panel didn't visibly open -- continuing anyway in case it's just slow.")
+
+    clear_btn = page.get_by_role("button", name=re.compile(r"^clear$", re.I)).first
+    if clear_btn.count() > 0:
+        clear_btn.click()
+    else:
+        log("No 'Clear' button found in Stop Filters -- continuing without clearing "
+            "(filters may already be at defaults).")
+
+    pickups_btn = page.get_by_role("button", name=re.compile(r"^pickups$", re.I)).first
+    if pickups_btn.count() == 0:
+        _dump_visible_elements(page, log, "Could not find the 'Pickups' filter toggle.")
+        return False
+    pickups_btn.click()
+
+    done_btn = page.get_by_role("button", name=re.compile(r"^done$", re.I)).first
+    if done_btn.count() > 0:
+        done_btn.click()
+    else:
+        log("No 'Done' button found -- the filter panel may auto-apply, continuing.")
+
+    page.wait_for_timeout(1500)  # let the table re-render
+    return True
+
+
+def _dump_visible_elements(page, log, context: str) -> None:
+    try:
+        elements = page.locator("button, a, input, span, div").evaluate_all(
+            "els => els.filter(e => e.offsetParent !== null).slice(0, 50).map(e => ({"
+            "tag: e.tagName, text: (e.innerText||'').trim().slice(0,40), "
+            "type: e.type||'', name: e.name||'', id: e.id||'', "
+            "placeholder: e.placeholder||''}))"
+            ".filter(e => e.text || e.name || e.placeholder)"
+        )
+        log(f"{context} Visible elements on screen:\n  " + "\n  ".join(str(e) for e in elements))
+    except Exception as e:
+        log(f"{context} (diagnostic dump itself failed: {e!r})")
+
+
+def scrape_pickups(page, log) -> list[dict]:
+    """Scrapes every row across every page of the (already Pickups-filtered)
+    P&D Time Commits table. Column order assumed from the live screenshot:
+    Route, Stop Type, SID, Address, Open, Close, Stop Sequence, Time, Status,
+    Actions -- adjusted here if the real table differs once this runs live."""
+    rows: list[dict] = []
+    seen_pages = 0
+    max_pages = 200  # safety valve against an infinite Next loop
+
+    while seen_pages < max_pages:
+        seen_pages += 1
+        try:
+            page.wait_for_selector("table tbody tr", timeout=15000)
+        except PWTimeout:
+            log(f"No table rows found on page {seen_pages} -- stopping pagination here.")
+            break
+
+        page_rows = page.locator("table tbody tr")
+        count = page_rows.count()
+        for i in range(count):
+            cells = page_rows.nth(i).locator("td").all_inner_texts()
+            if len(cells) < 9:
+                continue  # header/spacer row or layout surprise -- skip rather than guess
+            rows.append({
+                "route": cells[0].strip(),
+                "stop_type": cells[1].strip(),
+                "sid": cells[2].strip(),
+                "address": cells[3].strip(),
+                "open": cells[4].strip(),
+                "close": cells[5].strip(),
+                "stop_sequence": cells[6].strip(),
+                "time": cells[7].strip(),
+                "status": cells[8].strip(),
+            })
+        log(f"Scraped {count} row(s) from page {seen_pages} ({len(rows)} total so far).")
+
+        next_btn = page.get_by_role("button", name=re.compile(r"^next$", re.I)).first
+        if next_btn.count() == 0:
+            log("No 'Next' button found -- treating this as the last page.")
+            break
+        is_disabled = next_btn.is_disabled() if hasattr(next_btn, "is_disabled") else False
+        if is_disabled:
+            break
+        next_btn.click()
+        page.wait_for_timeout(1200)
+
+    return rows
+
+
+# ------------------------------------------------------------------- report
+
+def build_report(gc_rows: list[dict], fedex_rows: list[dict], now: datetime) -> tuple[str, list[dict]]:
+    flagged = []
+    for gc in gc_rows:
+        if gc["status"].strip().upper() != "COMPLETED":
+            continue
+        match = match_address(gc["address"], fedex_rows)
+        if match is not None and match["pu_closed_blank"]:
+            flagged.append({**gc, "fedex_shipper": match["shipper"], "fedex_station": match["station"]})
+
+    summary = (f"*🔀 GroundCloud vs FedEx — Pickup Reconciliation*\n"
+               f"Checked {now:%I:%M %p %Z} · {len(gc_rows)} GroundCloud pickup(s) scanned · "
+               f"{len(flagged)} mismatch(es)")
+
+    if not flagged:
+        text = "GroundCloud/FedEx reconciliation: no mismatches this run."
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary + "\n✅ No mismatches found."}}]
+        return text, blocks
+
+    header = f"{'SID':<8}{'FEDEX SHIPPER':<24}{'ADDRESS':<30}{'GC STATUS'}"
+    lines = [header]
+    for f in flagged:
+        shipper = (f["fedex_shipper"] or "Unknown")[:23]
+        address = (f["address"] or "")[:29]
+        lines.append(f"{f['sid']:<8}{shipper:<24}{address:<30}{f['status']}")
+    table = "\n".join(lines)
+
+    text = f"GroundCloud/FedEx reconciliation: {len(flagged)} mismatch(es)"
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"```{table}```"}},
+        {"type": "context", "elements": [{"type": "mrkdwn",
+            "text": "GroundCloud shows *Completed*, but FedEx's *PU Closed* is still blank for this stop."}]},
+    ]
+    return text, blocks
+
+
+# --------------------------------------------------------------------- main
+
+def run(headless: bool, dry_run: bool) -> int:
+    now = datetime.now(STATION_TZ)
+
+    if not GROUNDCLOUD_USERNAME or not GROUNDCLOUD_PASSWORD:
+        log("GROUNDCLOUD_USERNAME/GROUNDCLOUD_PASSWORD not set -- nothing to do.")
+        return 1
+
+    fedex_path = find_latest_fedex_export(now)
+    if fedex_path is None:
+        log(f"No FedEx export found for today ({now:%Y-%m-%d}) in {FEDEX_DOWNLOADS_DIR} -- "
+            "skipping this run (the FedEx monitor may not have completed a check yet).")
+        return 1
+    log(f"Using FedEx export: {fedex_path.name}")
+    fedex_rows = load_fedex_rows(fedex_path)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        ctx = browser.new_context()
+        page = ctx.new_page()
+        try:
+            if not login(page, log):
+                return 1
+            if not apply_pickups_filter(page, log):
+                return 1
+            gc_rows = scrape_pickups(page, log)
+        finally:
+            browser.close()
+
+    log(f"Scraped {len(gc_rows)} GroundCloud pickup row(s) total.")
+    text, blocks = build_report(gc_rows, fedex_rows, now)
+    post_to_slack(text, blocks, dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--headful", action="store_true", help="show the browser window for this run")
+    ap.add_argument("--dry-run", action="store_true", help="print the report instead of posting to Slack")
+    args = ap.parse_args()
+    sys.exit(run(headless=not args.headful, dry_run=args.dry_run))
