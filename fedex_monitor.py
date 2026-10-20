@@ -686,6 +686,20 @@ def goto_pickup_manifest(ctx, page, log):
             except PWTimeout:
                 pass  # diagnostics below will show whatever actually loaded
             log(f"Opened FCC. URL: {fcc_page.url!r}, title: {fcc_page.title()!r}")
+
+            # The original homepage tab is left dangling open here otherwise, sharing
+            # the same login session/cookies as fcc_page -- and ICEfaces' icepush
+            # long-poll connection explicitly refuses to be shared across more than one
+            # open tab for the same session ("Blocking connection cannot be shared
+            # among multiple web-contexts", seen on every single automated attempt
+            # 2026-10-20 right as the manifest form's AJAX render died, while every
+            # manual login -- naturally only ever one tab -- worked fine). Close it
+            # now that fcc_page is the only tab we still need.
+            try:
+                page.close()
+                log("Closed the original homepage tab now that FCC is open in its own tab.")
+            except Exception as e:
+                log(f"Could not close the homepage tab (not fatal, continuing): {e!r}")
         except PWTimeout:
             log("Could not find/click 'FedEx Customer Connection' inside the FCC "
                 "Links iframe (the iframe itself did render). Links visible in it: "
