@@ -953,12 +953,43 @@ def process_manifest(fcc_page, ctx, log, dry_run: bool) -> bool:
             looks_rendered = fcc_page.locator('input[name="manifestForm:search"]').count() > 0
         except Exception:
             pass
+
         if looks_rendered:
-            log("No export captured this cycle (0 results for this search, or the "
-                "export control needs a one-line selector fix -- see any message "
-                "above).")
-            ping_healthcheck(log, ok=True)
-            return True
+            # The form being present isn't enough on its own to call this healthy --
+            # 2026-10-20 15:45 showed exactly why: form rendered, "99 records found"
+            # on screen, the export control clicked successfully 4 times in a row,
+            # but the download itself never fired. The OLD version of this check
+            # treated "form present + no export" as always meaning a genuine 0-result
+            # day and returned healthy=True unconditionally -- which silently
+            # skipped alerting AND skipped updating both Slack channels for the rest
+            # of the day, with nothing in Slack to show anything was wrong. Now it
+            # actually reads the on-screen result count and only calls this healthy
+            # when it genuinely says 0/no results; a real count (or one we can't
+            # parse) is treated as a real failure, not assumed benign.
+            result_text = ""
+            try:
+                result_text = fcc_page.locator(
+                    '[id="manifestForm:outputResultCount"], [id="manifestForm:panelResultCount"]'
+                ).first.inner_text()
+            except Exception:
+                pass
+            m = re.search(r"(\d+)\s*records?\s*found", result_text, re.I)
+            genuinely_empty = ("no results" in result_text.lower()
+                                or (m is not None and int(m.group(1)) == 0))
+            if genuinely_empty:
+                log(f"No export captured this cycle -- genuinely 0 results "
+                    f"({result_text.strip()!r}). Nothing to export, healthy.")
+                ping_healthcheck(log, ok=True)
+                return True
+            log(f"No export captured this cycle, but the page shows "
+                f"{result_text.strip() or '(no result-count text found)'!r} -- "
+                "NOT a genuine empty result, so treating this as a real export "
+                "failure (not silently healthy). This also means run_watch will "
+                "log back in fresh, which is what cleared this exact symptom "
+                "the last time it happened.")
+            ping_healthcheck(log, ok=False)
+            return False
+
         log("No export AND the manifest form itself isn't on the page anymore -- "
             "this looks like a stuck/broken render (columns never came up), not a "
             "genuine answer from FedEx. Treating this session as dead.")
