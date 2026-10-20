@@ -1171,6 +1171,16 @@ def run_once(headless: bool, dry_run: bool) -> int:
             return 1
 
         ok = process_manifest(fcc_page, ctx, log, dry_run)
+        # browser.close() alone only drops our end of the connection -- it never tells
+        # FedEx's PeopleSoft/ICEfaces app this session is done, so the server-side
+        # session (and its icepush "blocking connection") can be left dangling. Unlike
+        # run_watch(), this function was never calling attempt_logout() at all, which
+        # means every run_once() call tonight (every --dry-run and one-off run) left
+        # its session unclosed server-side -- a very plausible contributor to the very
+        # next run colliding with it via "Blocking connection cannot be shared among
+        # multiple web-contexts" (confirmed 2026-10-20: the 19:25 run succeeded, then
+        # the very next run_once() at 19:29 failed with exactly that error).
+        attempt_logout(fcc_page, log)
         browser.close()
 
     return 0 if ok else 1
