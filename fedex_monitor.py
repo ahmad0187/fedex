@@ -23,7 +23,17 @@ WHAT THIS SCRIPT DOES EACH RUN
   5. Looks up ./state.db (SQLite) to see which of those stops it already alerted on, so
      the SAME stop isn't re-sent every 15 minutes. It alerts again only when a stop's
      status escalates (AT_RISK -> PAST_CLOSE) or a new stop enters the 60-minute window.
-  6. Posts new/escalated alerts to Slack via an Incoming Webhook (SLACK_WEBHOOK_URL).
+  6. Posts a Slack alert -- one TABLE listing every stop currently within 60 minutes
+     of its close time (or past it), resent only when that set actually changes (a
+     stop drops off once picked up, a new one is added once it enters the window) --
+     via an Incoming Webhook (SLACK_WEBHOOK_URL).
+  7. Separately, if SLACK_BOT_TOKEN and SLACK_DAILY_CHANNEL are set: posts (once per
+     day) and then edits in place every 30 minutes a second Slack message, in its own
+     channel, listing EVERY stop on today's manifest (Station, Shipper, Address,
+     Ready, Close, PU Closed, Reas Code), with rows flagged 🟡 within 1hr of close /
+     🔴 past close with nothing on file. See the SLACK_BOT_TOKEN comment above for
+     how to get that token -- this is a separate credential from SLACK_WEBHOOK_URL
+     because editing a message needs the Slack Web API, not an Incoming Webhook.
 
 This version is built to run on an ephemeral runner (GitHub Actions) that has no disk
 of its own between runs -- see fedex_login.py for the one-time login step, and
@@ -50,12 +60,13 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-from pickup_risk import load_manifest, find_at_risk, format_alert, format_alert_blocks
+from pickup_risk import load_manifest, find_at_risk, format_at_risk_table, build_daily_rows
 
 HERE = Path(__file__).resolve().parent
 STORAGE_STATE_PATH = HERE / "storage_state.json"
@@ -64,7 +75,7 @@ STATE_DB = HERE / "state.db"
 
 # Delaware is Eastern time -- change this if your station is elsewhere.
 STATION_TZ = ZoneInfo("America/New_York")
-WARN_MINUTES = 120
+WARN_MINUTES = 60  # back to 1 hour -- was widened to 120 for testing on 2026-10-19
 FAILURE_ALERT_COOLDOWN_MIN = 120  # don't spam Slack more than once every 2h on failure
 LOGIN_RETRY_BACKOFF_SEC = 120  # gap between retried logins in --watch mode (see
 # login_with_retries() -- was 60s; widened 2026-10-19 after console diagnostics
@@ -93,6 +104,24 @@ def _next_active_window_start(now: datetime) -> datetime:
 
 HOMEPAGE_URL = "https://mybizaccount.fedex.com/"
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+
+# "Daily Manifest" channel -- a separate Slack channel that gets ONE message per day
+# (all of today's pickups, not just at-risk ones), edited in place every
+# DAILY_UPDATE_INTERVAL_MIN minutes instead of re-posted. Editing an existing message
+# needs the Slack Web API (chat.postMessage / chat.update) with a real Bot Token --
+# an Incoming Webhook (SLACK_WEBHOOK_URL above) can only post new messages, never
+# edit one, so this is intentionally a second, separate credential:
+#   1. On the Slack App used for SLACK_WEBHOOK_URL (or a new one), add the
+#      "chat:write" Bot Token Scope under OAuth & Permissions, reinstall the app,
+#      and copy the "Bot User OAuth Token" (starts with xoxb-).
+#   2. Invite that bot into the target channel (/invite @YourAppName there).
+#   3. Set SLACK_BOT_TOKEN to that token and SLACK_DAILY_CHANNEL to the channel's ID
+#      (right-click the channel in Slack -> View channel details -> copy Channel ID,
+#      looks like C0123456789 -- NOT the #channel-name).
+# Both unset == this feature is simply skipped (nothing breaks).
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+SLACK_DAILY_CHANNEL = os.environ.get("SLACK_DAILY_CHANNEL", "")
+DAILY_UPDATE_INTERVAL_MIN = 30
 # Optional: a healthchecks.io (or similar) ping URL. Pinged once per run -- the plain
 # URL on success, "<url>/fail" on a failed run -- so that service can show a run
 # history/dashboard and alert if a scheduled run doesn't check in at all (meaning the
@@ -198,6 +227,138 @@ def send_slack(text: str, dry_run: bool = False, blocks: list[dict] | None = Non
     resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=15)
     if resp.status_code >= 300:
         print(f"Slack post failed ({resp.status_code}): {resp.text}", file=sys.stderr)
+
+
+# ------------------------------------------------------------------ slack (Web API)
+# Only used by the "Daily Manifest" channel below, which needs to EDIT a message
+# in place -- something an Incoming Webhook (send_slack, above) cannot do.
+
+def slack_api_post(channel: str, text: str, blocks: list[dict], dry_run: bool) -> Optional[str]:
+    """Posts a new message via chat.postMessage. Returns its ts (needed to edit it
+    later), or None if it wasn't actually sent (dry-run, not configured, or failed)."""
+    if dry_run or not SLACK_BOT_TOKEN or not channel:
+        print(f"[dry-run / Daily Manifest not configured] would POST to {channel or '(no channel set)'}:\n{text}\n")
+        return None
+    resp = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        json={"channel": channel, "text": text, "blocks": blocks},
+        timeout=15,
+    )
+    data = resp.json()
+    if not data.get("ok"):
+        print(f"Slack chat.postMessage failed: {data}", file=sys.stderr)
+        return None
+    return data.get("ts")
+
+
+def slack_api_update(channel: str, ts: str, text: str, blocks: list[dict], dry_run: bool) -> bool:
+    """Edits an existing message (by channel + ts) via chat.update."""
+    if dry_run or not SLACK_BOT_TOKEN or not channel or not ts:
+        print(f"[dry-run / Daily Manifest not configured] would UPDATE {channel or '(no channel set)'} ts={ts}:\n{text}\n")
+        return False
+    resp = requests.post(
+        "https://slack.com/api/chat.update",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        json={"channel": channel, "ts": ts, "text": text, "blocks": blocks},
+        timeout=15,
+    )
+    data = resp.json()
+    if not data.get("ok"):
+        print(f"Slack chat.update failed: {data}", file=sys.stderr)
+        return False
+    return True
+
+
+_STATUS_ICON = {"ok": "  ", "warn": "🟡", "overdue": "🔴"}
+
+
+def _chunk_table_lines(header: str, lines: list[str], max_chars: int = 2800) -> list[str]:
+    """Slack's section text is capped at 3000 chars, and a single day's manifest
+    (50-90 rows) can run well past that -- splits into several code-block chunks,
+    each repeating the header, rather than truncating rows."""
+    chunks, cur, cur_len = [], [header], len(header)
+    for line in lines:
+        if cur_len + len(line) + 1 > max_chars:
+            chunks.append("\n".join(cur))
+            cur, cur_len = [header], len(header)
+        cur.append(line)
+        cur_len += len(line) + 1
+    if len(cur) > 1:
+        chunks.append("\n".join(cur))
+    return chunks
+
+
+def build_daily_manifest_message(rows: list[dict], now: datetime) -> tuple[str, list[dict]]:
+    n_warn = sum(1 for r in rows if r["status"] == "warn")
+    n_overdue = sum(1 for r in rows if r["status"] == "overdue")
+    summary = (f"*📦 FedEx Daily Pickup Manifest — {now:%Y-%m-%d}*\n"
+               f"Updated {now:%I:%M %p %Z} · next update in ~{DAILY_UPDATE_INTERVAL_MIN} min · "
+               f"{len(rows)} stop(s) · 🟡 {n_warn} within 1hr  🔴 {n_overdue} overdue")
+
+    header = f"{'':<2}{'STN':<5}{'SHIPPER':<20}{'ADDRESS':<26}{'READY':<6}{'CLOSE':<6}{'PUCLSD':<7}{'REAS'}"
+    lines = []
+    for r in rows:
+        icon = _STATUS_ICON.get(r["status"], "  ")
+        shipper = (r["shipper"] or "")[:19]
+        address = (r["address"] or "")[:25]
+        station = r["station"] if r["station"] is not None else ""
+        lines.append(f"{icon:<2}{station:<5}{shipper:<20}{address:<26}{r['ready']:<6}"
+                      f"{r['close']:<6}{r['pu_closed']:<7}{r['reas_code']}")
+
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary}}]
+    for chunk in _chunk_table_lines(header, lines):
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"```{chunk}```"}})
+    text = f"Daily Pickup Manifest — {now:%Y-%m-%d} — {len(rows)} stop(s)"
+    return text, blocks
+
+
+def update_daily_manifest_channel(df, now: datetime, log, dry_run: bool) -> None:
+    """Posts today's full manifest table once (first successful check of the day),
+    then edits that SAME message in place every DAILY_UPDATE_INTERVAL_MIN minutes
+    for the rest of the day. No-ops entirely if SLACK_BOT_TOKEN/SLACK_DAILY_CHANNEL
+    aren't set."""
+    if not SLACK_BOT_TOKEN or not SLACK_DAILY_CHANNEL:
+        return
+
+    conn = db_connect()
+
+    def get_meta(key: str) -> Optional[str]:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(key: str, value: str) -> None:
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+    today_str = now.date().isoformat()
+    stored_date = get_meta("daily_manifest_date")
+    stored_ts = get_meta("daily_manifest_ts")
+    stored_last_update = get_meta("daily_manifest_last_update")
+
+    rows = build_daily_rows(df, now, warn_minutes=WARN_MINUTES, manifest_day=now)
+    text, blocks = build_daily_manifest_message(rows, now)
+
+    if stored_date != today_str or not stored_ts:
+        ts = slack_api_post(SLACK_DAILY_CHANNEL, text, blocks, dry_run)
+        if ts or dry_run:
+            set_meta("daily_manifest_date", today_str)
+            set_meta("daily_manifest_ts", ts or "")
+            set_meta("daily_manifest_last_update", now.isoformat())
+            conn.commit()
+            log(f"Daily Manifest: posted today's message ({len(rows)} stop(s)).")
+    else:
+        last_update = datetime.fromisoformat(stored_last_update) if stored_last_update else None
+        if last_update is None or (now - last_update) >= timedelta(minutes=DAILY_UPDATE_INTERVAL_MIN):
+            ok = slack_api_update(SLACK_DAILY_CHANNEL, stored_ts, text, blocks, dry_run)
+            if ok or dry_run:
+                set_meta("daily_manifest_last_update", now.isoformat())
+                conn.commit()
+                log(f"Daily Manifest: updated today's message in place ({len(rows)} stop(s)).")
+    conn.close()
 
 
 # --------------------------------------------------------------------------- browser
@@ -750,7 +911,6 @@ def process_manifest(fcc_page, ctx, log, dry_run: bool) -> bool:
     broken -- callers treat that as 'this session probably needs a fresh login' --
     not when there's simply nothing to export (that's a normal, healthy outcome)."""
     now = datetime.now(STATION_TZ)
-    now_iso = now.isoformat()
 
     try:
         xls_path = export_and_download(fcc_page, log, ctx=ctx)
@@ -793,13 +953,35 @@ def process_manifest(fcc_page, ctx, log, dry_run: bool) -> bool:
     risky = find_at_risk(df, now=now, warn_minutes=WARN_MINUTES, manifest_day=now)
     log(f"{len(risky)} stop(s) currently within the {WARN_MINUTES}-minute warning window.")
 
+    # "At Risk" channel: one table of EVERY currently-at-risk/past-close stop, resent
+    # as a new message only when that set actually changes (a stop drops off once
+    # picked up, a new one is added once it enters the window) -- not one message
+    # per stop, and not a resend every cycle if nothing changed.
+    current_keys = ",".join(f"{k}:{v}" for k, v in sorted(s.key for s in risky))
     conn = db_connect()
-    to_send = filter_new_or_escalated(conn, risky, now_iso)
+    row = conn.execute("SELECT value FROM meta WHERE key='last_at_risk_keys'").fetchone()
+    prev_keys = row[0] if row else None
+    if current_keys != (prev_keys or ""):
+        if risky:
+            text, blocks = format_at_risk_table(risky, now)
+            send_slack(text, dry_run=dry_run, blocks=blocks)
+            log(f"At-risk set changed -- sent a fresh table ({len(risky)} stop(s)).")
+        elif prev_keys:  # had stops before, now zero -- say so once
+            send_slack("✅ All previously at-risk FedEx pickups have been closed out "
+                        "-- none currently at risk.", dry_run=dry_run)
+            log("At-risk set changed -- now empty, sent all-clear message.")
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('last_at_risk_keys', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (current_keys,),
+        )
+        conn.commit()
+    else:
+        log("At-risk set unchanged since last check -- not resending the table.")
     conn.close()
 
-    for stop in to_send:
-        send_slack(format_alert(stop), dry_run=dry_run, blocks=format_alert_blocks(stop))
-    log(f"Sent {len(to_send)} new/escalated Slack alert(s).")
+    update_daily_manifest_channel(df, now, log, dry_run)
+
     ping_healthcheck(log, ok=True)
     return True
 

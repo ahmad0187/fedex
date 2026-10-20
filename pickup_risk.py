@@ -143,6 +143,87 @@ def format_alert(stop: RiskyStop) -> str:
     return "\n".join(lines)
 
 
+def format_at_risk_table(stops: list[RiskyStop], now: datetime) -> tuple[str, list[dict]]:
+    """Slack message for the 'At Risk' channel: ONE table listing every stop
+    currently in the warning window (not one message per stop). Caller re-sends
+    this whenever the set of at-risk stops actually changes (a stop drops off once
+    picked up, a new one is added once it enters the window) -- see
+    fedex_monitor.py's at-risk-set diffing."""
+    header = f"{'':<2}{'STN':<5}{'SHIPPER':<22}{'CLOSE':<7}{'LEFT':<9}"
+    lines = [header]
+    for s in stops:
+        icon = "⛔" if s.status == "PAST_CLOSE" else "🟠"
+        shipper = (s.shipper_name or "Unknown")[:21]
+        close_s = s.close.strftime("%H:%M")
+        left = (f"-{abs(s.minutes_to_close):.0f}m" if s.status == "PAST_CLOSE"
+                else f"{s.minutes_to_close:.0f}m")
+        lines.append(f"{icon:<2}{s.station:<5}{shipper:<22}{close_s:<7}{left:<9}")
+    table = "\n".join(lines)
+
+    n_past = sum(1 for s in stops if s.status == "PAST_CLOSE")
+    n_risk = len(stops) - n_past
+    summary = (f"*⚠️ FedEx Pickup Manifest — At Risk / Past Close*\n"
+               f"{len(stops)} stop(s) within 60 min of close ({n_risk} at risk, "
+               f"{n_past} past close) — {now:%I:%M %p %Z}")
+    text = f"At Risk / Past Close: {len(stops)} stop(s) — see table"
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"```{table}```"}},
+    ]
+    return text, blocks
+
+
+def build_daily_rows(df: pd.DataFrame, now: datetime, warn_minutes: float = 60.0,
+                     manifest_day: Optional[datetime] = None) -> list[dict]:
+    """Every row on today's manifest (not just at-risk ones), trimmed to the
+    columns the 'Daily Manifest' Slack channel wants, with a per-row status:
+      'ok'      -- plenty of time, or already closed out / reason on file
+      'warn'    -- PU Closed empty, no reason code, <=warn_minutes to close
+      'overdue' -- PU Closed empty, no reason code, close time already passed
+    Sorted by close time so the most urgent rows are easy to scan."""
+    day = (manifest_day or now).date()
+    rows: list[dict] = []
+
+    for _, row in df.iterrows():
+        close_t = _parse_hhmm(row.get("Close"))
+        ready_t = _parse_hhmm(row.get("Ready"))
+        pu_closed_t = _parse_hhmm(row.get("PU Closed"))
+        reas_code = row.get("Reas Code")
+        pu_closed_blank = _is_blank(row.get("PU Closed"))
+        reas_blank = _is_blank(reas_code)
+
+        status = "ok"
+        if pu_closed_blank and reas_blank and close_t is not None:
+            close_dt = datetime.combine(day, close_t, tzinfo=now.tzinfo)
+            minutes_left = (close_dt - now).total_seconds() / 60.0
+            if minutes_left < 0:
+                status = "overdue"
+            elif minutes_left <= warn_minutes:
+                status = "warn"
+
+        station = row.get("Station")
+        rows.append({
+            "station": int(station) if not pd.isna(station) else None,
+            "shipper": str(row.get("Shipper Name") or "").strip(),
+            "address": ", ".join(x for x in (
+                str(row.get("Address Line 1") or "").strip(),
+                str(row.get("City") or "").strip(),
+                str(row.get("State") or "").strip(),
+            ) if x),
+            "ready": ready_t.strftime("%H:%M") if ready_t else "",
+            "close": close_t.strftime("%H:%M") if close_t else "",
+            "pu_closed": pu_closed_t.strftime("%H:%M") if pu_closed_t else "",
+            "reas_code": "" if reas_blank else str(reas_code).strip(),
+            "status": status,
+            "_sort": close_t or dtime(23, 59),
+        })
+
+    rows.sort(key=lambda r: r["_sort"])
+    for r in rows:
+        r.pop("_sort", None)
+    return rows
+
+
 def format_alert_blocks(stop: RiskyStop) -> list[dict]:
     """Slack Block Kit version: a 2-column Metric/Value table (Alert Level, Account,
     Station ID, Address, Cutoff Time, Time Remaining, System Flag), matching the

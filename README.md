@@ -70,11 +70,26 @@ secret. Trade-off: the session eventually expires and needs a manual refresh (se
 You can set up both — the script tries the saved session first, falls back to
 auto-login if the session's expired and credentials are set.
 
-### 4. Add the Slack secret
+### 4. Add the Slack secret(s)
 
-In your repo: **Settings → Secrets and variables → Actions → New repository secret.**
+In your repo: **Settings → Secrets and variables → Actions → New repository secret**
+(or in the VPS's `.env` if running via systemd instead of GitHub Actions).
 
-- `SLACK_WEBHOOK_URL` — the webhook URL from step 2.
+- `SLACK_WEBHOOK_URL` — the webhook URL from step 2. Posts the "At Risk" table to
+  your main alerts channel.
+- `SLACK_BOT_TOKEN` and `SLACK_DAILY_CHANNEL` — **optional**, only needed for the
+  separate "Daily Manifest" channel (see below). An Incoming Webhook can only post
+  new messages, never edit one, and the Daily Manifest message is edited in place
+  rather than reposted, so it needs a real Slack Bot Token instead:
+  1. On your Slack App (Slack API site → Your Apps → the app behind the webhook, or
+     a new app), go to **OAuth & Permissions**, add the **`chat:write`** Bot Token
+     Scope, and reinstall the app to the workspace.
+  2. Copy the **Bot User OAuth Token** (starts with `xoxb-`) → `SLACK_BOT_TOKEN`.
+  3. In Slack, create/pick the channel, invite the bot into it (`/invite @YourApp`),
+     then right-click the channel → **View channel details** → copy the **Channel
+     ID** (looks like `C0123456789`, not `#channel-name`) → `SLACK_DAILY_CHANNEL`.
+  If either is left unset, the Daily Manifest channel is simply skipped — the "At
+  Risk" channel above works independently of it.
 
 ### 5. Test it manually before trusting the schedule
 
@@ -91,10 +106,25 @@ minutes under load), which doesn't matter for a 60-minute warning window.
 
 ## How re-alerting works
 
-A stop is alerted once when it first enters the 60-minute window, and again only if
-it escalates from 🟠 AT_RISK to ⛔ PAST_CLOSE — not every 15 minutes while it sits
-unresolved. That memory (`state.db`) is committed back to the repo by the workflow
-after each run, since GitHub Actions runners don't keep any disk between runs.
+### "At Risk" channel (`SLACK_WEBHOOK_URL`)
+
+Every cycle, instead of one message per stop, a single table is built listing
+*every* stop currently within 60 minutes of close (or past it). That table is only
+re-sent when the set of stops actually changes — a stop drops off once it's picked
+up, a new one is added once it enters the 60-minute window — not on every cycle
+while the list sits unchanged. If the list goes from non-empty to empty, a one-line
+"✅ all clear" message is sent instead of a table. This state (`state.db`) persists
+across runs; on GitHub Actions it's committed back to the repo after each run since
+runners don't keep disk between runs — on the VPS it's just a local file.
+
+### "Daily Manifest" channel (`SLACK_BOT_TOKEN` / `SLACK_DAILY_CHANNEL`)
+
+The first successful check of the day posts one message listing every stop on
+today's manifest (Station, Shipper, Address, Ready, Close, PU Closed, Reas Code).
+That same message is then **edited in place** every 30 minutes for the rest of the
+day — not reposted — with each row marked 🟡 if it's within 60 minutes of close and
+still open, 🔴 if its close time has passed and it's still open, or unmarked
+otherwise. A new day starts a new message.
 
 ## When login fails
 
