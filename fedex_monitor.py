@@ -139,7 +139,7 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 # Both unset == this feature is simply skipped (nothing breaks).
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_DAILY_CHANNEL = os.environ.get("SLACK_DAILY_CHANNEL", "")
-DAILY_UPDATE_INTERVAL_MIN = 30
+DAILY_UPDATE_INTERVAL_MIN = 15  # matches the At Risk channel's full-check cadence
 # Optional: a healthchecks.io (or similar) ping URL. Pinged once per run -- the plain
 # URL on success, "<url>/fail" on a failed run -- so that service can show a run
 # history/dashboard and alert if a scheduled run doesn't check in at all (meaning the
