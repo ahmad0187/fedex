@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import signal
 import sqlite3
 import sys
 import time
@@ -101,6 +102,23 @@ def _next_active_window_start(now: datetime) -> datetime:
     if now >= end_today:
         return start_today + timedelta(days=1)
     return now
+
+class GracefulShutdown(BaseException):
+    """Raised from a SIGTERM/SIGINT handler so `systemctl stop`/`restart` unwinds
+    through run_watch's normal try/finally (which logs out of FedEx before exiting)
+    instead of killing the process mid-step. Deliberately a BaseException, not
+    Exception: this codebase has many broad `except Exception: pass` guards for
+    resilience against page/network flakiness, and those must NOT swallow a
+    shutdown request -- only KeyboardInterrupt/SystemExit normally skip them, and
+    this needs the same treatment."""
+
+
+def _install_shutdown_handler() -> None:
+    def _handler(signum, frame):
+        raise GracefulShutdown()
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
 
 HOMEPAGE_URL = "https://mybizaccount.fedex.com/"
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
@@ -1125,6 +1143,8 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
         conn.close()
         ping_healthcheck(log, ok=False)
 
+    _install_shutdown_handler()
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         ctx = None
@@ -1266,6 +1286,13 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
                     continue
 
                 time.sleep(15)
+        except GracefulShutdown:
+            # systemctl stop/restart (or Ctrl+C) -- fall through to the `finally`
+            # below so FedEx gets a real sign-out before this process dies, instead
+            # of SIGTERM killing it mid-step and leaving a stale server-side session
+            # for the next login to fight through (the exact "blocking connection"
+            # collision debugged 2026-10-19).
+            log("Received shutdown signal -- logging out of FedEx before exiting.")
         finally:
             if ctx is not None:
                 attempt_logout(fcc_page, log)
