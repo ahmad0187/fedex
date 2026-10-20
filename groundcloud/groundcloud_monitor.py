@@ -190,6 +190,20 @@ def load_fedex_rows(path: Path) -> list[dict]:
 
 def login(page, log) -> bool:
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    # This looks like a client-rendered (JS) app -- domcontentloaded alone can
+    # fire before the login form itself has actually rendered. Give it a real
+    # chance to finish, then wait specifically for ANY input to show up
+    # before even trying the specific field selectors below.
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except PWTimeout:
+        log("Page didn't reach networkidle within 20s (ok if it's just a slow "
+            "background request) -- continuing anyway.")
+    try:
+        page.wait_for_selector("input", timeout=15000)
+    except PWTimeout:
+        log("No <input> elements appeared within 15s of loading the login page -- "
+            "see the diagnostic dump below for what IS on the page.")
 
     user_candidates = [
         lambda: page.locator('input[name="username"]').first,
@@ -276,14 +290,27 @@ def apply_pickups_filter(page, log) -> bool:
 
 def _dump_visible_elements(page, log, context: str) -> None:
     try:
-        elements = page.locator("button, a, input, span, div").evaluate_all(
+        log(f"{context} Page title: {page.title()!r} -- URL: {page.url}")
+        counts = page.evaluate(
+            "() => ({input: document.querySelectorAll('input').length, "
+            "button: document.querySelectorAll('button').length, "
+            "iframe: document.querySelectorAll('iframe').length, "
+            "bodyTextLen: (document.body.innerText||'').length})"
+        )
+        log(f"{context} Raw element counts on the page: {counts}")
+        if counts.get("iframe"):
+            log(f"{context} NOTE: page has {counts['iframe']} iframe(s) -- the login "
+                "form may be INSIDE one of those, not on the top-level page.")
+        # Don't filter by text/name/placeholder here -- an <input> with none of
+        # those is exactly the case we need to see, not hide.
+        elements = page.locator("button, a, input, span[role], div[role]").evaluate_all(
             "els => els.filter(e => e.offsetParent !== null).slice(0, 50).map(e => ({"
             "tag: e.tagName, text: (e.innerText||'').trim().slice(0,40), "
             "type: e.type||'', name: e.name||'', id: e.id||'', "
             "placeholder: e.placeholder||''}))"
-            ".filter(e => e.text || e.name || e.placeholder)"
         )
-        log(f"{context} Visible elements on screen:\n  " + "\n  ".join(str(e) for e in elements))
+        log(f"{context} Visible interactive elements on screen "
+            f"({len(elements)} shown, up to 50):\n  " + "\n  ".join(str(e) for e in elements))
     except Exception as e:
         log(f"{context} (diagnostic dump itself failed: {e!r})")
 
