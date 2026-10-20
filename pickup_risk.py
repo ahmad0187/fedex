@@ -23,6 +23,12 @@ import pandas as pd
 
 SHEET = "Stop Details"
 
+# Daily Manifest row order: at-risk (🟡) first since those need action soonest, then
+# past-close/overdue (🔴), then everything else (completed, or not yet in the warning
+# window) at the bottom -- so the rows needing attention stay pinned to the top of
+# the table on every re-sort instead of drifting by close time.
+_STATUS_SORT_RANK = {"warn": 0, "overdue": 1, "ok": 2}
+
 # A stop's unique key on one day's manifest. PU List is the pickup-group id and PUID
 # is the line number within it (both repeat day to day), so the pair is what to
 # dedupe/track alerts against -- not just PUID alone (PUID resets to 1 for every list).
@@ -215,7 +221,7 @@ def build_daily_rows(df: pd.DataFrame, now: datetime, warn_minutes: float = 60.0
             "pu_closed": pu_closed_t.strftime("%H:%M") if pu_closed_t else "",
             "reas_code": "" if reas_blank else str(reas_code).strip(),
             "status": status,
-            "_sort": close_t or dtime(23, 59),
+            "_sort": (_STATUS_SORT_RANK[status], close_t or dtime(23, 59)),
         })
 
     rows.sort(key=lambda r: r["_sort"])
