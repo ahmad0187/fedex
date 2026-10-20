@@ -87,8 +87,8 @@ LOGIN_RETRY_BACKOFF_SEC = 120  # gap between retried logins in --watch mode (see
 # right at the start of the next window. Only read by run_watch(); run_once() always
 # runs when called, so a plain cron/systemd-timer setup controls its own hours via
 # OnCalendar/schedule instead.
-ACTIVE_WINDOW_START_HOUR = 8   # 8:00 AM Delaware time
-ACTIVE_WINDOW_END_HOUR = 20    # 8:00 PM Delaware time (exclusive)
+ACTIVE_WINDOW_START_HOUR = 11  # 11:00 AM Delaware time
+ACTIVE_WINDOW_END_HOUR = 19    # 7:00 PM Delaware time (exclusive)
 
 
 def _next_active_window_start(now: datetime) -> datetime:
@@ -139,7 +139,7 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 # Both unset == this feature is simply skipped (nothing breaks).
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_DAILY_CHANNEL = os.environ.get("SLACK_DAILY_CHANNEL", "")
-DAILY_UPDATE_INTERVAL_MIN = 15  # matches the At Risk channel's full-check cadence
+DAILY_UPDATE_INTERVAL_MIN = 20  # matches the At Risk channel's full-check cadence
 # Optional: a healthchecks.io (or similar) ping URL. Pinged once per run -- the plain
 # URL on success, "<url>/fail" on a failed run -- so that service can show a run
 # history/dashboard and alert if a scheduled run doesn't check in at all (meaning the
@@ -314,14 +314,15 @@ def build_daily_manifest_message(rows: list[dict], now: datetime) -> tuple[str, 
                f"Updated {now:%I:%M %p %Z} · next update in ~{DAILY_UPDATE_INTERVAL_MIN} min · "
                f"{len(rows)} stop(s) · 🟡 {n_warn} within 1hr  🔴 {n_overdue} overdue")
 
-    header = f"{'':<2}{'STN':<5}{'SHIPPER':<20}{'ADDRESS':<26}{'READY':<6}{'CLOSE':<6}{'PUCLSD':<7}{'REAS'}"
+    header = f"{'':<2}{'STN':<5}{'WA':<6}{'SHIPPER':<20}{'ADDRESS':<26}{'READY':<6}{'CLOSE':<6}{'PUCLSD':<7}{'REAS'}"
     lines = []
     for r in rows:
         icon = _STATUS_ICON.get(r["status"], "  ")
         shipper = (r["shipper"] or "")[:19]
         address = (r["address"] or "")[:25]
         station = r["station"] if r["station"] is not None else ""
-        lines.append(f"{icon:<2}{station:<5}{shipper:<20}{address:<26}{r['ready']:<6}"
+        wa = r.get("wa") or ""
+        lines.append(f"{icon:<2}{station:<5}{wa:<6}{shipper:<20}{address:<26}{r['ready']:<6}"
                       f"{r['close']:<6}{r['pu_closed']:<7}{r['reas_code']}")
 
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary}}]
@@ -1150,8 +1151,8 @@ def run_once(headless: bool, dry_run: bool) -> int:
     return 0 if ok else 1
 
 
-def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
-              keepalive_min: int = 2, max_consecutive_failures: int = 3) -> int:
+def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 20,
+              keepalive_min: int = 4, max_consecutive_failures: int = 3) -> int:
     """Alternative to run_once for long-running use (systemd Type=simple instead of a
     timer firing run_once every cycle). Logs in ONCE and keeps that same browser
     session alive for as long as it can, instead of a brand new Okta SSO handshake
@@ -1396,10 +1397,10 @@ if __name__ == "__main__":
                           "--full-interval minutes, with cheap keep-alive Search "
                           "clicks every --keepalive-interval minutes in between, "
                           "instead of a brand new Okta login every cycle")
-    ap.add_argument("--full-interval", type=int, default=15,
-                     help="minutes between full checks in --watch mode (default: 15)")
-    ap.add_argument("--keepalive-interval", type=int, default=2,
-                     help="minutes between keep-alive Search clicks in --watch mode (default: 2)")
+    ap.add_argument("--full-interval", type=int, default=20,
+                     help="minutes between full checks in --watch mode (default: 20)")
+    ap.add_argument("--keepalive-interval", type=int, default=4,
+                     help="minutes between keep-alive Search clicks in --watch mode (default: 4)")
     ap.add_argument("--max-failures", type=int, default=3,
                      help="consecutive failed re-logins in --watch mode before giving "
                           "up and exiting (default: 3)")

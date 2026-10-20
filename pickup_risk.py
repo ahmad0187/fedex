@@ -155,7 +155,7 @@ def format_at_risk_table(stops: list[RiskyStop], now: datetime) -> tuple[str, li
     this whenever the set of at-risk stops actually changes (a stop drops off once
     picked up, a new one is added once it enters the window) -- see
     fedex_monitor.py's at-risk-set diffing."""
-    header = f"{'':<2}{'STN':<5}{'SHIPPER':<22}{'CLOSE':<7}{'LEFT':<9}"
+    header = f"{'':<2}{'STN':<5}{'WA':<6}{'SHIPPER':<22}{'CLOSE':<7}{'LEFT':<9}"
     lines = [header]
     for s in stops:
         icon = "⛔" if s.status == "PAST_CLOSE" else "🟠"
@@ -163,7 +163,7 @@ def format_at_risk_table(stops: list[RiskyStop], now: datetime) -> tuple[str, li
         close_s = s.close.strftime("%H:%M")
         left = (f"-{abs(s.minutes_to_close):.0f}m" if s.status == "PAST_CLOSE"
                 else f"{s.minutes_to_close:.0f}m")
-        lines.append(f"{icon:<2}{s.station:<5}{shipper:<22}{close_s:<7}{left:<9}")
+        lines.append(f"{icon:<2}{s.station:<5}{s.wa:<6}{shipper:<22}{close_s:<7}{left:<9}")
     table = "\n".join(lines)
 
     n_past = sum(1 for s in stops if s.status == "PAST_CLOSE")
@@ -222,6 +222,7 @@ def build_daily_rows(df: pd.DataFrame, now: datetime, warn_minutes: float = 60.0
         station = row.get("Station")
         rows.append({
             "station": int(station) if not pd.isna(station) else None,
+            "wa": str(row.get("WA") or "").strip(),
             "shipper": str(row.get("Shipper Name") or "").strip(),
             "address": ", ".join(x for x in (
                 str(row.get("Address Line 1") or "").strip(),
