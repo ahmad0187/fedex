@@ -1111,7 +1111,17 @@ def run_once(headless: bool, dry_run: bool) -> int:
     DOWNLOAD_DIR.mkdir(exist_ok=True)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        # channel="chromium" forces the full Chromium binary's headless mode instead of
+        # Playwright's default "chromium_headless_shell" -- confirmed 2026-10-20: manual
+        # logins in a real browser worked every time, while headless_shell consistently
+        # failed at the exact same ICEfaces AJAX step ("singleSubmit failed cannot find
+        # enclosing form" / "Blocking connection cannot be shared among multiple
+        # web-contexts") on every attempt for 2+ hours regardless of session cleanup.
+        # headless_shell is a stripped-down binary with known gaps vs real Chrome on
+        # older/complex JS apps -- this ICEfaces app (a 2000s-era JSF AJAX framework)
+        # is exactly that kind of app. Requires `playwright install chromium` once
+        # (headless_shell is downloaded by default; the full chromium channel is not).
+        browser = p.chromium.launch(headless=headless, channel="chromium")
         # FedEx serves a MOBILE layout to this script (onclick handlers under
         # "ice.mobi.*") -- forcing a desktop UA/viewport was tried and made things
         # worse (the content pane stopped rendering within any reasonable wait), so
@@ -1224,7 +1234,12 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 20,
     _install_shutdown_handler()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        # See the matching comment in run_once() -- channel="chromium" uses the full
+        # Chromium binary's headless mode instead of the stripped-down
+        # chromium_headless_shell default, which consistently failed to render this
+        # ICEfaces app's AJAX-driven manifest form while manual logins in a real
+        # browser worked every time (confirmed 2026-10-20).
+        browser = p.chromium.launch(headless=headless, channel="chromium")
         ctx = None
         fcc_page = None
 
