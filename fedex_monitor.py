@@ -1152,6 +1152,16 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
     # alert. EXPORT_STUCK_ALERT_THRESHOLD full checks in a row (not counting keep-alive
     # probes) is enough to rule out a one-off FedEx blip before paging the user.
     EXPORT_STUCK_ALERT_THRESHOLD = 2
+    # Hard cap on how many times in a row a full-check failure (export stuck, or a
+    # genuinely dead session) is allowed to trigger an immediate fresh relogin.
+    # Without this, a PERSISTENT problem (not a one-off blip) would relogin every
+    # single cycle with zero backoff between attempts -- repeated rapid-fire Okta
+    # logins, which is exactly the kind of thing that caused the session-collision
+    # mess on 2026-10-19. After this many in a row, give up and exit instead (same
+    # "3 strikes" exit-1 pattern login_with_retries already uses) -- systemd
+    # (Restart=always, RestartSec=30) then restarts with a real pause and a
+    # completely clean browser, rather than this process hammering FedEx forever.
+    MAX_CONSECUTIVE_EXPORT_FAILURES = 3
     consecutive_export_failures = 0
     today_confirmed_date = None  # date() of the last "today's check is live" ping sent
 
@@ -1301,6 +1311,14 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 15,
                         consecutive_export_failures += 1
                         if consecutive_export_failures >= EXPORT_STUCK_ALERT_THRESHOLD:
                             send_failure_alert("EXPORT_STUCK")
+                        if consecutive_export_failures >= MAX_CONSECUTIVE_EXPORT_FAILURES:
+                            log(f"{MAX_CONSECUTIVE_EXPORT_FAILURES} full checks in a row have "
+                                "failed (export stuck, or session dying) even after relogins "
+                                "in between -- giving up for now instead of continuing to "
+                                "relogin every cycle with no backoff. Exiting; systemd "
+                                "(Restart=always, RestartSec=30) will restart with a real "
+                                "pause and a completely fresh browser.")
+                            return 1
                 elif now >= next_keepalive:
                     log("-- keep-alive probe --")
                     healthy = keepalive_probe(fcc_page, log)
