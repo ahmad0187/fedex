@@ -1156,6 +1156,14 @@ def run_once(headless: bool, dry_run: bool) -> int:
         fcc_page = goto_pickup_manifest(ctx, page, log)
 
         if fcc_page in (None, "LOGGED_OUT"):
+            # goto_pickup_manifest() doesn't hand back a page reference on failure, but
+            # whatever page it was working with (e.g. the one stuck mid-render) is
+            # still open on ctx -- best-effort sign-out from each, same reasoning as
+            # the success path above: this is exactly the failure branch that's been
+            # firing most often, so leaving it unsigned-out would keep contributing to
+            # the next run's "multiple web-contexts" collision.
+            for leftover_page in ctx.pages:
+                attempt_logout(leftover_page, log)
             browser.close()
             conn = db_connect()
             if should_send_failure_alert(conn, now):
@@ -1270,7 +1278,15 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 20,
         def login(close_old: bool):
             nonlocal ctx
             if close_old and ctx is not None:
-                attempt_logout(fcc_page, log)
+                # fcc_page is None here on every FAILED previous attempt (login_with_
+                # retries resets it via its tuple unpack), so attempt_logout(fcc_page,
+                # log) was silently a no-op on every failed retry all night (it
+                # early-returns on page is None) -- ctx.close() alone never tells
+                # FedEx's server the session is done. Use whatever page(s) are still
+                # actually open on the old context instead, regardless of what the
+                # last goto_pickup_manifest() call handed back.
+                for leftover_page in ctx.pages:
+                    attempt_logout(leftover_page, log)
                 try:
                     ctx.close()
                 except Exception:
