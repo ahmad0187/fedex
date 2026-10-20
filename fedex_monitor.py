@@ -314,7 +314,8 @@ def build_daily_manifest_message(rows: list[dict], now: datetime) -> tuple[str, 
                f"Updated {now:%I:%M %p %Z} · next update in ~{DAILY_UPDATE_INTERVAL_MIN} min · "
                f"{len(rows)} stop(s) · 🟡 {n_warn} within 1hr  🔴 {n_overdue} overdue")
 
-    header = f"{'':<2}{'STN':<5}{'WA':<6}{'SHIPPER':<20}{'ADDRESS':<26}{'READY':<6}{'CLOSE':<6}{'PUCLSD':<7}{'REAS'}"
+    header = (f"{'':<3}{'STN':<7}{'WA':<8}{'SHIPPER':<22}{'ADDRESS':<28}{'READY':<8}"
+              f"{'CLOSE':<8}{'PUCLSD':<9}{'REAS'}")
     lines = []
     for r in rows:
         icon = _STATUS_ICON.get(r["status"], "  ")
@@ -322,8 +323,8 @@ def build_daily_manifest_message(rows: list[dict], now: datetime) -> tuple[str, 
         address = (r["address"] or "")[:25]
         station = r["station"] if r["station"] is not None else ""
         wa = r.get("wa") or ""
-        lines.append(f"{icon:<2}{station:<5}{wa:<6}{shipper:<20}{address:<26}{r['ready']:<6}"
-                      f"{r['close']:<6}{r['pu_closed']:<7}{r['reas_code']}")
+        lines.append(f"{icon:<3}{station:<7}{wa:<8}{shipper:<22}{address:<28}{r['ready']:<8}"
+                      f"{r['close']:<8}{r['pu_closed']:<9}{r['reas_code']}")
 
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary}}]
     for chunk in _chunk_table_lines(header, lines):
