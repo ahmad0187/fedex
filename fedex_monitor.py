@@ -644,6 +644,11 @@ def goto_pickup_manifest(ctx, page, log):
     def _capture_console(target_page):
         target_page.on("console", lambda m: console_messages.append(f"[{m.type}] {m.text}"))
         target_page.on("pageerror", lambda e: console_messages.append(f"[pageerror] {e}"))
+        # Stashed as a plain attribute (Playwright Page objects allow this) so any
+        # OTHER function holding this same page object -- export_and_download, in
+        # particular -- can read the live, growing console log too, without needing
+        # its own listener wired up or the list threaded through every call site.
+        target_page._console_log = console_messages
 
     if "cpc-mi" in page.url:
         _capture_console(fcc_page)  # already on the FCC app page, nothing more to open
@@ -900,7 +905,37 @@ def export_and_download(page, log, ctx=None) -> Path | None:
             dl_info.value.save_as(dest)
             return dest
         except Exception as e:
-            log(f"Download did not complete for this candidate: {e!r}")
+            # The click matching and firing successfully but no download event ever
+            # arriving (confirmed live 2026-10-20, ~30+ min into a session) needs
+            # more than "timed out" to actually diagnose -- so capture what's
+            # happening around the failed attempt: any extra tabs/popups sitting
+            # open (the export is documented to open one and self-close; one stuck
+            # open, or several piling up across retries, is a real clue), and
+            # whatever the page's own JS has logged most recently (reuses the
+            # console/pageerror capture goto_pickup_manifest already wired up --
+            # see _capture_console's `_console_log` stash -- no new listener here).
+            try:
+                open_pages = [{"url": p.url, "title": p.title()} for p in downloader.pages]
+            except Exception:
+                open_pages = "(could not enumerate open pages)"
+            recent_console = getattr(page, "_console_log", [])[-15:]
+            log(f"Download did not complete for this candidate: {e!r}\n"
+                f"  Open tabs/popups right now ({len(open_pages) if isinstance(open_pages, list) else '?'}): {open_pages}\n"
+                f"  Most recent console/page-error entries: {recent_console}")
+            # The export is documented to open a popup that downloads and
+            # self-closes -- if one failed to self-close, it's another browser
+            # context sharing this same FedEx session, which is exactly the shape
+            # of the "Blocking connection cannot be shared among multiple
+            # web-contexts" collision seen before. Close anything stray before the
+            # next candidate/attempt, rather than letting them pile up.
+            try:
+                for p in downloader.pages:
+                    if p is not page and not p.is_closed():
+                        stray_url = p.url
+                        p.close()
+                        log(f"  Closed a stray popup/tab left open: {stray_url!r}")
+            except Exception as cleanup_err:
+                log(f"  (stray-popup cleanup itself failed, non-fatal: {cleanup_err!r})")
             continue
 
     # Nothing worked -- dump what IS on screen so this is a quick fix, not a guess.
