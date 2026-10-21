@@ -125,15 +125,28 @@ def normalize_address(addr: str) -> str:
     return " ".join(words)
 
 
+def _score(gc_norm: str, fx_norm: str) -> float:
+    """difflib ratio, or token containment when the house number is identical.
+    GroundCloud often appends a business name to the street ('6716 CHURCH HILL RD
+    RAMSEY PONTIAC, CHESTERTOWN') that FedEx omits, which drops the plain ratio
+    to ~0.7-0.8 even though every FedEx token is present."""
+    ratio = difflib.SequenceMatcher(None, gc_norm, fx_norm).ratio()
+    g, f = gc_norm.split(), fx_norm.split()
+    if g and f and g[0] == f[0]:
+        contain = len(set(g) & set(f)) / min(len(set(g)), len(set(f)))
+        ratio = max(ratio, contain)
+    return ratio
+
+
 def best_match(gc_address: str, fedex_rows: list[dict]) -> tuple[Optional[dict], float]:
-    """Closest FedEx row (any score) and its similarity ratio -- used both by
-    match_address() and by the per-row diagnostics logged on every run."""
+    """Closest FedEx row (any score) and its similarity -- used by match_address()
+    and by the per-row diagnostics logged on every run."""
     gc_norm = normalize_address(gc_address)
     if not gc_norm:
         return None, 0.0
     best, best_ratio = None, 0.0
     for row in fedex_rows:
-        ratio = difflib.SequenceMatcher(None, gc_norm, row["_addr_norm"]).ratio()
+        ratio = _score(gc_norm, row["_addr_norm"])
         if ratio > best_ratio:
             best, best_ratio = row, ratio
     return best, best_ratio
@@ -384,38 +397,72 @@ def scrape_pickups(page, log) -> list[dict]:
 
 # ------------------------------------------------------------------- report
 
-def build_report(gc_rows: list[dict], fedex_rows: list[dict], now: datetime) -> tuple[str, list[dict]]:
-    flagged = []
+# GroundCloud's table says "Delivered" for a finished pickup (seen live 2026-10-21;
+# the original code only looked for "Completed" so it could never flag anything).
+GC_DONE_STATUSES = {"DELIVERED", "COMPLETED"}
+
+
+def find_mismatches(gc_rows: list[dict], fedex_rows: list[dict]) -> list[dict]:
+    """Per FedEx address: GroundCloud shows N finished pickups there, FedEx has C
+    rows with PU Closed filled and O still blank. Many stops share an address
+    (e.g. 14 pickups at one street address), so matching one row to one row by
+    address would pick an arbitrary FedEx row. Counting is order-independent:
+    flag when GroundCloud has finished more than FedEx has closed AND FedEx still
+    has open rows there; the number flagged is min(N - C, O)."""
+    done_by_addr: dict[str, list[dict]] = {}
     for gc in gc_rows:
-        if gc["status"].strip().upper() != "COMPLETED":
+        if gc["status"].strip().upper() not in GC_DONE_STATUSES:
             continue
-        match = match_address(gc["address"], fedex_rows)
-        if match is not None and match["pu_closed_blank"]:
-            flagged.append({**gc, "fedex_shipper": match["shipper"], "fedex_station": match["station"]})
+        m = match_address(gc["address"], fedex_rows)
+        if m is not None:
+            done_by_addr.setdefault(m["_addr_norm"], []).append(gc)
+
+    flagged = []
+    for key, gcs in done_by_addr.items():
+        fx = [r for r in fedex_rows if r["_addr_norm"] == key]
+        closed = sum(1 for r in fx if not r["pu_closed_blank"])
+        open_rows = [r for r in fx if r["pu_closed_blank"]]
+        n = min(len(gcs) - closed, len(open_rows))
+        if n > 0:
+            flagged.append({
+                "address": gcs[0]["address"],
+                "fedex_shipper": next((r["shipper"] for r in open_rows if r["shipper"]), ""),
+                "fedex_station": open_rows[0]["station"],
+                "gc_done": len(gcs), "fx_closed": closed, "fx_open": len(open_rows),
+                "n": n,
+            })
+    flagged.sort(key=lambda f: f["address"])
+    return flagged
+
+
+def build_report(gc_rows: list[dict], fedex_rows: list[dict], now: datetime) -> tuple[str, list[dict]]:
+    flagged = find_mismatches(gc_rows, fedex_rows)
+    total = sum(f["n"] for f in flagged)
 
     summary = (f"*🔀 GroundCloud vs FedEx — Pickup Reconciliation*\n"
                f"Checked {now:%I:%M %p %Z} · {len(gc_rows)} GroundCloud pickup(s) scanned · "
-               f"{len(flagged)} mismatch(es)")
+               f"{total} mismatch(es) at {len(flagged)} address(es)")
 
     if not flagged:
         text = "GroundCloud/FedEx reconciliation: no mismatches this run."
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary + "\n✅ No mismatches found."}}]
         return text, blocks
 
-    header = f"{'SID':<8}{'FEDEX SHIPPER':<24}{'ADDRESS':<30}{'GC STATUS'}"
+    header = f"{'STN':<7}{'FEDEX SHIPPER':<24}{'ADDRESS':<32}{'GC DONE':<9}{'FX CLOSED':<11}{'OPEN'}"
     lines = [header]
     for f in flagged:
-        shipper = (f["fedex_shipper"] or "Unknown")[:23]
-        address = (f["address"] or "")[:29]
-        lines.append(f"{f['sid']:<8}{shipper:<24}{address:<30}{f['status']}")
+        shipper = (f["fedex_shipper"] or "Unknown")[:22]
+        address = (f["address"] or "")[:30]
+        stn = str(int(f["fedex_station"])) if str(f["fedex_station"]).replace(".0", "").isdigit() else ""
+        lines.append(f"{stn:<7}{shipper:<24}{address:<32}{f['gc_done']:<9}{f['fx_closed']:<11}{f['fx_open']}")
     table = "\n".join(lines)
 
-    text = f"GroundCloud/FedEx reconciliation: {len(flagged)} mismatch(es)"
+    text = f"GroundCloud/FedEx reconciliation: {total} mismatch(es)"
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"```{table}```"}},
         {"type": "context", "elements": [{"type": "mrkdwn",
-            "text": "GroundCloud shows *Completed*, but FedEx's *PU Closed* is still blank for this stop."}]},
+            "text": "GroundCloud shows these pickups *Delivered*, but FedEx's *PU Closed* is still blank for stops at that address."}]},
     ]
     return text, blocks
 
