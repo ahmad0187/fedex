@@ -282,6 +282,7 @@ def apply_pickups_filter(page, log) -> bool:
         _dump_visible_elements(page, log, "Could not find the 'Pickups' filter toggle.")
         return False
     pickups_btn.click()
+    log("Stop Filters: clicked Clear, then Pickups.")
 
     done_btn = page.get_by_role("button", name=re.compile(r"^done$", re.I)).first
     if done_btn.count() > 0:
@@ -289,6 +290,7 @@ def apply_pickups_filter(page, log) -> bool:
     else:
         log("No 'Done' button found -- the filter panel may auto-apply, continuing.")
 
+    log("Stop Filters: clicked Done (or auto-applied).")
     page.wait_for_timeout(1500)  # let the table re-render
     return True
 
@@ -460,6 +462,9 @@ def run(headless: bool, dry_run: bool) -> int:
     # Per-row evidence (log only, never Slack): a silent "no mismatches" is only
     # trustworthy if the addresses really matched, so show every row's best match.
     log(f"FedEx manifest rows loaded: {len(fedex_rows)}")
+    from collections import Counter
+    log(f"GC stop types scraped: {dict(Counter(r['stop_type'] for r in gc_rows))}; "
+        f"statuses: {dict(Counter(r['status'] for r in gc_rows))}")
     for gc in gc_rows:
         m, ratio = best_match(gc["address"], fedex_rows)
         log(f"  GC sid={gc['sid']} status={gc['status']!r} addr={gc['address']!r} -> "
