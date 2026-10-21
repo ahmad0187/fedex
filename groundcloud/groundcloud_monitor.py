@@ -125,22 +125,27 @@ def normalize_address(addr: str) -> str:
     return " ".join(words)
 
 
-def match_address(gc_address: str, fedex_rows: list[dict]) -> Optional[dict]:
-    """Best fuzzy match of a GroundCloud address against every FedEx row's
-    normalized address. Returns None below ADDRESS_MATCH_THRESHOLD -- an
-    unmatched GroundCloud row is simply skipped, not flagged (per spec: only
-    flag when a FedEx match IS found and PU Closed is blank there)."""
+def best_match(gc_address: str, fedex_rows: list[dict]) -> tuple[Optional[dict], float]:
+    """Closest FedEx row (any score) and its similarity ratio -- used both by
+    match_address() and by the per-row diagnostics logged on every run."""
     gc_norm = normalize_address(gc_address)
     if not gc_norm:
-        return None
+        return None, 0.0
     best, best_ratio = None, 0.0
     for row in fedex_rows:
         ratio = difflib.SequenceMatcher(None, gc_norm, row["_addr_norm"]).ratio()
         if ratio > best_ratio:
             best, best_ratio = row, ratio
-    if best is not None and best_ratio >= ADDRESS_MATCH_THRESHOLD:
-        return best
-    return None
+    return best, best_ratio
+
+
+def match_address(gc_address: str, fedex_rows: list[dict]) -> Optional[dict]:
+    """Best fuzzy match of a GroundCloud address against every FedEx row's
+    normalized address. Returns None below ADDRESS_MATCH_THRESHOLD -- an
+    unmatched GroundCloud row is simply skipped, not flagged (per spec: only
+    flag when a FedEx match IS found and PU Closed is blank there)."""
+    best, best_ratio = best_match(gc_address, fedex_rows)
+    return best if best is not None and best_ratio >= ADDRESS_MATCH_THRESHOLD else None
 
 
 # ------------------------------------------------------------- fedex import
@@ -441,6 +446,14 @@ def run(headless: bool, dry_run: bool) -> int:
             browser.close()
 
     log(f"Scraped {len(gc_rows)} GroundCloud pickup row(s) total.")
+    # Per-row evidence (log only, never Slack): a silent "no mismatches" is only
+    # trustworthy if the addresses really matched, so show every row's best match.
+    log(f"FedEx manifest rows loaded: {len(fedex_rows)}")
+    for gc in gc_rows:
+        m, ratio = best_match(gc["address"], fedex_rows)
+        log(f"  GC sid={gc['sid']} status={gc['status']!r} addr={gc['address']!r} -> "
+            f"best ratio={ratio:.2f} "
+            + (f"FedEx addr={m['address']!r} PU-closed-blank={m['pu_closed_blank']}" if m else "no candidate"))
     text, blocks = build_report(gc_rows, fedex_rows, now)
     post_to_slack(text, blocks, dry_run)
     return 0
