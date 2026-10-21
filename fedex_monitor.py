@@ -714,18 +714,42 @@ def goto_pickup_manifest(ctx, page, log):
     # make Playwright's normal actionability checks (occlusion/stability) time out
     # even though the element is really there and a real click would land fine.
     pdm = fcc_page.get_by_text(re.compile(r"^P&D Manifests$", re.I)).first
-    pdm_ok = robust_click(pdm, log, "'P&D Manifests' tab")
-    if not pdm_ok:
-        log("Bottom-nav items visible: "
-            + str(fcc_page.locator("text=/Messaging|P&D Manifests|Service Area Status|"
-                                    "Pickup Alerts|SCH PU Mgmt|P&D Planning/").all_text_contents()))
-    log(f"Clicked 'P&D Manifests' tab (ok={pdm_ok}).")
+
+    # Race fix (2026-10-21): the failing runs' console shows our click landing in the
+    # SAME second the page finished loading, while ICEfaces was still initialising its
+    # hiddenForm ("singleSubmit failed cannot find enclosing form", then the hiddenForm
+    # 'load' submit replaces the view and the click is lost). Runs where the click
+    # happened to land after init worked. So: let the page settle first, and if the
+    # form doesn't appear shortly, click again (the view is stable by then) rather
+    # than waiting a full 30s on a click that was swallowed.
+    try:
+        fcc_page.wait_for_load_state("networkidle", timeout=10000)
+    except PWTimeout:
+        pass
+    fcc_page.wait_for_timeout(4000)
+
+    form_ready = False
+    for click_try in range(1, 4):
+        pdm_ok = robust_click(pdm, log, "'P&D Manifests' tab")
+        if not pdm_ok:
+            log("Bottom-nav items visible: "
+                + str(fcc_page.locator("text=/Messaging|P&D Manifests|Service Area Status|"
+                                        "Pickup Alerts|SCH PU Mgmt|P&D Planning/").all_text_contents()))
+        log(f"Clicked 'P&D Manifests' tab (try {click_try}/3, ok={pdm_ok}).")
+        try:
+            fcc_page.wait_for_selector('input[name="manifestForm:search"]', timeout=10000)
+            form_ready = True
+            break
+        except PWTimeout:
+            log(f"Form not there 10s after click try {click_try}/3.")
+            fcc_page.wait_for_timeout(2000)
 
     # The desktop UI loads noticeably slower than the mobile one we were previously
     # (accidentally) served -- wait for the actual content pane (the Search button,
     # confirmed live as id="manifestForm:search") rather than a fixed 1s delay.
     try:
-        fcc_page.wait_for_selector('input[name="manifestForm:search"]', timeout=30000)
+        if not form_ready:
+            raise PWTimeout("form never appeared after 3 click tries")
         log("Pickup Manifest form (Date/Work Area/Search) has rendered.")
     except PWTimeout:
         log("Timed out waiting for the Pickup Manifest form to render after clicking "
