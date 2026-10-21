@@ -420,8 +420,16 @@ def run(headless: bool, dry_run: bool) -> int:
     fedex_rows = load_fedex_rows(fedex_path)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        ctx = browser.new_context()
+        # groundcloud.io answers plain curl with 200 but returned 403 to Playwright's
+        # default headless browser (2026-10-21), whose user agent says "HeadlessChrome".
+        # Present as a normal desktop Chrome instead (full chromium build, real UA,
+        # normal viewport).
+        browser = p.chromium.launch(headless=headless, channel="chromium")
+        ctx = browser.new_context(
+            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"),
+            viewport={"width": 1366, "height": 768},
+        )
         page = ctx.new_page()
         try:
             if not login(page, log):
