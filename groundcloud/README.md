@@ -19,7 +19,7 @@ recent `.xls` the FedEx service already downloads every 15 minutes into
    match -- the two systems format addresses slightly differently).
 6. Flags it **only** when GroundCloud says Completed and the matched FedEx
    row's `PU Closed` is still blank. (Not the reverse.)
-7. Posts a fresh message every run to its own Slack channel -- a table of
+7. Edits ONE Slack message in place every run (all-clear or table).
    flagged mismatches, or a one-line all-clear if there are none.
 
 ## Setup

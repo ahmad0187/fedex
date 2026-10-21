@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
 import os
 import re
 import sys
@@ -71,6 +72,12 @@ GROUNDCLOUD_PASSWORD = os.environ.get("GROUNDCLOUD_PASSWORD", "")
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_GC_CHANNEL = os.environ.get("SLACK_GC_CHANNEL", "")
 
+STATE_FILE = HERE / "state.json"   # this service's own state (message ts) -- not shared with FedEx
+# Only run while the FedEx monitor is active (it starts ~10:30 ET); the hourly
+# timer fires all day, so the script checks the clock itself.
+RUN_WINDOW_START = (10, 30)
+RUN_WINDOW_END = (19, 10)   # inclusive of the 19:00 run
+
 ADDRESS_MATCH_THRESHOLD = 0.85  # difflib ratio -- see match_address()
 
 
@@ -80,22 +87,47 @@ def log(msg: str) -> None:
 
 # --------------------------------------------------------------------- Slack
 
+def _load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        STATE_FILE.write_text(json.dumps(state))
+    except Exception as e:
+        log(f"Could not save {STATE_FILE.name}: {e!r}")
+
+
 def post_to_slack(text: str, blocks: list[dict], dry_run: bool) -> bool:
-    """One-shot post (chat.postMessage) -- this channel gets a fresh message
-    every run, never edited in place, so there's no ts/state to track."""
+    """Keeps ONE message in the channel and edits it in place every run
+    (chat.update), so mismatches that got corrected simply disappear from it.
+    If there's no saved message yet, or Slack refuses the edit (message deleted,
+    etc.), posts a fresh one and remembers its ts."""
     if dry_run or not SLACK_BOT_TOKEN or not SLACK_GC_CHANNEL:
         print(f"[dry-run / not configured] would POST to {SLACK_GC_CHANNEL or '(no channel set)'}:\n{text}\n")
         return False
-    resp = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        json={"channel": SLACK_GC_CHANNEL, "text": text, "blocks": blocks},
-        timeout=15,
-    )
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    state = _load_state()
+    if state.get("channel") == SLACK_GC_CHANNEL and state.get("ts"):
+        resp = requests.post("https://slack.com/api/chat.update", headers=headers, timeout=15,
+                             json={"channel": SLACK_GC_CHANNEL, "ts": state["ts"],
+                                   "text": text, "blocks": blocks})
+        data = resp.json()
+        if data.get("ok"):
+            log("Updated the existing Slack message in place.")
+            return True
+        log(f"chat.update failed ({data.get('error')}) -- posting a new message instead.")
+    resp = requests.post("https://slack.com/api/chat.postMessage", headers=headers, timeout=15,
+                         json={"channel": SLACK_GC_CHANNEL, "text": text, "blocks": blocks})
     data = resp.json()
     if not data.get("ok"):
         print(f"Slack chat.postMessage failed: {data}", file=sys.stderr)
         return False
+    _save_state({"channel": SLACK_GC_CHANNEL, "ts": data.get("ts")})
+    log("Posted a new Slack message (its ts is saved so later runs edit it).")
     return True
 
 
@@ -435,17 +467,19 @@ def find_mismatches(gc_rows: list[dict], fedex_rows: list[dict]) -> list[dict]:
     return flagged
 
 
-def build_report(gc_rows: list[dict], fedex_rows: list[dict], now: datetime) -> tuple[str, list[dict]]:
+def build_report(gc_rows: list[dict], fedex_rows: list[dict], now: datetime,
+                 fedex_asof: str = "") -> tuple[str, list[dict]]:
     flagged = find_mismatches(gc_rows, fedex_rows)
     total = sum(f["n"] for f in flagged)
 
     summary = (f"*🔀 GroundCloud vs FedEx — Pickup Reconciliation*\n"
                f"Checked {now:%I:%M %p %Z} · {len(gc_rows)} GroundCloud pickup(s) scanned · "
-               f"{total} mismatch(es) at {len(flagged)} address(es)")
+               f"{total} mismatch(es) at {len(flagged)} address(es)"
+               + (f"\nFedEx manifest as of {fedex_asof}" if fedex_asof else ""))
 
     if not flagged:
-        text = "GroundCloud/FedEx reconciliation: no mismatches this run."
-        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary + "\n✅ No mismatches found."}}]
+        text = "GroundCloud/FedEx reconciliation: no mismatch found during this hour."
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary + "\n✅ No mismatch found during this hour."}}]
         return text, blocks
 
     header = f"{'STN':<7}{'FEDEX SHIPPER':<24}{'ADDRESS':<32}{'GC DONE':<9}{'FX CLOSED':<11}{'OPEN'}"
@@ -472,6 +506,13 @@ def build_report(gc_rows: list[dict], fedex_rows: list[dict], now: datetime) -> 
 def run(headless: bool, dry_run: bool) -> int:
     now = datetime.now(STATION_TZ)
 
+    mins = now.hour * 60 + now.minute
+    if not dry_run and not (RUN_WINDOW_START[0] * 60 + RUN_WINDOW_START[1] <= mins
+                            <= RUN_WINDOW_END[0] * 60 + RUN_WINDOW_END[1]):
+        log(f"Outside the run window {RUN_WINDOW_START[0]}:{RUN_WINDOW_START[1]:02d}-"
+            f"{RUN_WINDOW_END[0]}:{RUN_WINDOW_END[1]:02d} ET -- skipping.")
+        return 0
+
     if not GROUNDCLOUD_USERNAME or not GROUNDCLOUD_PASSWORD:
         log("GROUNDCLOUD_USERNAME/GROUNDCLOUD_PASSWORD not set -- nothing to do.")
         return 1
@@ -481,7 +522,10 @@ def run(headless: bool, dry_run: bool) -> int:
         log(f"No FedEx export found for today ({now:%Y-%m-%d}) in {FEDEX_DOWNLOADS_DIR} -- "
             "skipping this run (the FedEx monitor may not have completed a check yet).")
         return 1
-    log(f"Using FedEx export: {fedex_path.name}")
+    exported = datetime.fromtimestamp(fedex_path.stat().st_mtime, STATION_TZ)
+    age_min = (now - exported).total_seconds() / 60
+    fedex_asof = f"{exported:%I:%M %p}" + (f" ⚠️ {age_min:.0f} min old" if age_min > 60 else "")
+    log(f"Using FedEx export: {fedex_path.name} (downloaded {exported:%H:%M}, {age_min:.0f} min ago)")
     fedex_rows = load_fedex_rows(fedex_path)
 
     with sync_playwright() as p:
@@ -517,7 +561,7 @@ def run(headless: bool, dry_run: bool) -> int:
         log(f"  GC sid={gc['sid']} status={gc['status']!r} addr={gc['address']!r} -> "
             f"best ratio={ratio:.2f} "
             + (f"FedEx addr={m['address']!r} PU-closed-blank={m['pu_closed_blank']}" if m else "no candidate"))
-    text, blocks = build_report(gc_rows, fedex_rows, now)
+    text, blocks = build_report(gc_rows, fedex_rows, now, fedex_asof)
     post_to_slack(text, blocks, dry_run)
     return 0
 

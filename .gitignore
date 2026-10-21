@@ -8,3 +8,4 @@ fedex_profile/
 !sample_manifest.xls
 __pycache__/
 *.pyc
+groundcloud/state.json

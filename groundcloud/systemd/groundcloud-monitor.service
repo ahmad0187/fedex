@@ -8,6 +8,9 @@ Type=oneshot
 WorkingDirectory=/root/fedex/groundcloud
 EnvironmentFile=/root/fedex/.env
 Environment=PYTHONUNBUFFERED=1
+# Never let a stuck run linger or compete with the live FedEx monitor.
+TimeoutStartSec=300
+Nice=15
 # Same venv fedex-monitor.service uses (confirmed 2026-10-20 via
 # `systemctl cat fedex-monitor.service`) -- has pandas/playwright/etc.
 # already installed, unlike the bare system python3.
