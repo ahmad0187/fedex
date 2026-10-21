@@ -87,15 +87,18 @@ LOGIN_RETRY_BACKOFF_SEC = 120  # gap between retried logins in --watch mode (see
 # right at the start of the next window. Only read by run_watch(); run_once() always
 # runs when called, so a plain cron/systemd-timer setup controls its own hours via
 # OnCalendar/schedule instead.
-ACTIVE_WINDOW_START_HOUR = 11  # 11:00 AM Delaware time
-ACTIVE_WINDOW_END_HOUR = 19    # 7:00 PM Delaware time (exclusive)
+ACTIVE_WINDOW_START_HOUR = 10    # 10:30 AM Delaware time -- login + navigation takes
+ACTIVE_WINDOW_START_MINUTE = 30  # ~30 min to get fully up, so it's ready by 11:00
+ACTIVE_WINDOW_END_HOUR = 19      # 7:00 PM Delaware time (exclusive)
+ACTIVE_WINDOW_LABEL = (f"{ACTIVE_WINDOW_START_HOUR}:{ACTIVE_WINDOW_START_MINUTE:02d}-"
+                       f"{ACTIVE_WINDOW_END_HOUR}:00")
 
 
 def _next_active_window_start(now: datetime) -> datetime:
     """If `now` is already inside the active window, returns `now` unchanged.
     Otherwise returns the next moment the window opens (today's or tomorrow's
     ACTIVE_WINDOW_START_HOUR)."""
-    start_today = now.replace(hour=ACTIVE_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
+    start_today = now.replace(hour=ACTIVE_WINDOW_START_HOUR, minute=ACTIVE_WINDOW_START_MINUTE, second=0, microsecond=0)
     end_today = now.replace(hour=ACTIVE_WINDOW_END_HOUR, minute=0, second=0, microsecond=0)
     if now < start_today:
         return start_today
@@ -1345,7 +1348,7 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 20,
             window_start = _next_active_window_start(now)
             if window_start > now:
                 wait_s = (window_start - now).total_seconds()
-                log(f"Outside the {ACTIVE_WINDOW_START_HOUR}:00-{ACTIVE_WINDOW_END_HOUR}:00 "
+                log(f"Outside the {ACTIVE_WINDOW_LABEL} "
                     f"{now:%Z} active window -- not logging in; idle for "
                     f"{wait_s / 60:.0f} min until it opens.")
                 time.sleep(wait_s)
@@ -1360,14 +1363,14 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 20,
             next_keepalive = datetime.now(STATION_TZ) + keepalive_interval
             log(f"Watch mode started: full check every {full_interval_min} min, "
                 f"keep-alive probe every {keepalive_min} min, active "
-                f"{ACTIVE_WINDOW_START_HOUR}:00-{ACTIVE_WINDOW_END_HOUR}:00 {now:%Z}.")
+                f"{ACTIVE_WINDOW_LABEL} {now:%Z}.")
 
             while True:
                 now = datetime.now(STATION_TZ)
 
-                if now.hour >= ACTIVE_WINDOW_END_HOUR or now.hour < ACTIVE_WINDOW_START_HOUR:
-                    log(f"End of the active window ({ACTIVE_WINDOW_START_HOUR}:00-"
-                        f"{ACTIVE_WINDOW_END_HOUR}:00 {now:%Z}) -- logging out and "
+                if _next_active_window_start(now) > now:
+                    log(f"End of the active window ({ACTIVE_WINDOW_LABEL} "
+                        f"{now:%Z}) -- logging out and "
                         "going idle until it reopens (no FedEx traffic at all while idle).")
                     try:
                         ctx.close()
