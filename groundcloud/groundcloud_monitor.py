@@ -356,15 +356,26 @@ def scrape_pickups(page, log) -> list[dict]:
             })
         log(f"Scraped {count} row(s) from page {seen_pages} ({len(rows)} total so far).")
 
-        next_btn = page.get_by_role("button", name=re.compile(r"^next$", re.I)).first
+        # Live DOM (screenshot 2026-10-21): <li class="page-item page-next"><button
+        # role="menuitem" aria-label="Go to next page" class="page-link">Next</button></li>.
+        # role=menuitem, so get_by_role("button") never matched it. On the last page the
+        # <li> gains class "disabled" (same as page-previous on page 1).
+        next_btn = page.locator('li.page-next button.page-link, button[aria-label="Go to next page"]').first
         if next_btn.count() == 0:
             log("No 'Next' button found -- treating this as the last page.")
             break
-        is_disabled = next_btn.is_disabled() if hasattr(next_btn, "is_disabled") else False
-        if is_disabled:
+        li_disabled = page.locator("li.page-next.disabled").count() > 0
+        if li_disabled or next_btn.is_disabled():
+            log("'Next' is disabled -- that was the last page.")
             break
+        first_before = page.locator("table tbody tr").first.inner_text()
         next_btn.click()
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(1500)
+        if page.locator("table tbody tr").first.inner_text() == first_before:
+            page.wait_for_timeout(2500)  # slow render -- give it one more chance
+            if page.locator("table tbody tr").first.inner_text() == first_before:
+                log("Clicked Next but the table didn't change -- stopping to avoid a loop.")
+                break
 
     return rows
 
