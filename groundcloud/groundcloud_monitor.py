@@ -518,7 +518,7 @@ def build_report(gc_rows: list[dict], fedex_rows: list[dict], now: datetime,
 
 # --------------------------------------------------------------------- main
 
-def run(headless: bool, dry_run: bool) -> int:
+def run(headless: bool, dry_run: bool, fedex_file: Optional[str] = None) -> int:
     now = datetime.now(STATION_TZ)
 
     mins = now.hour * 60 + now.minute
@@ -532,7 +532,7 @@ def run(headless: bool, dry_run: bool) -> int:
         log("GROUNDCLOUD_USERNAME/GROUNDCLOUD_PASSWORD not set -- nothing to do.")
         return 1
 
-    fedex_path = find_latest_fedex_export(now)
+    fedex_path = Path(fedex_file) if fedex_file else find_latest_fedex_export(now)
     if fedex_path is None:
         log(f"No FedEx export found for today ({now:%Y-%m-%d}) in {FEDEX_DOWNLOADS_DIR} -- "
             "skipping this run (the FedEx monitor may not have completed a check yet).")
@@ -584,6 +584,8 @@ def run(headless: bool, dry_run: bool) -> int:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--headful", action="store_true", help="show the browser window for this run")
+    ap.add_argument("--fedex-file", help="TESTING: compare against this .xls instead of today's latest "
+                                         "(e.g. yesterday's, before the FedEx monitor has run today)")
     ap.add_argument("--dry-run", action="store_true", help="print the report instead of posting to Slack")
     args = ap.parse_args()
-    sys.exit(run(headless=not args.headful, dry_run=args.dry_run))
+    sys.exit(run(headless=not args.headful, dry_run=args.dry_run, fedex_file=args.fedex_file))
