@@ -1,5 +1,5 @@
 [Unit]
-Description=GroundCloud vs FedEx pickup reconciliation (one-shot, triggered hourly by groundcloud-monitor.timer)
+Description=GroundCloud vs FedEx pickup reconciliation (one-shot, triggered every 15 minutes by groundcloud-monitor.timer)
 After=network-online.target
 Wants=network-online.target
 

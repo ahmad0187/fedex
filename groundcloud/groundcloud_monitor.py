@@ -101,33 +101,42 @@ def _save_state(state: dict) -> None:
         log(f"Could not save {STATE_FILE.name}: {e!r}")
 
 
-def post_to_slack(text: str, blocks: list[dict], dry_run: bool) -> bool:
-    """Keeps ONE message in the channel and edits it in place every run
-    (chat.update), so mismatches that got corrected simply disappear from it.
-    If there's no saved message yet, or Slack refuses the edit (message deleted,
-    etc.), posts a fresh one and remembers its ts."""
+def post_to_slack(text: str, blocks: list[dict], dry_run: bool, has_mismatch: bool = False) -> bool:
+    """Keeps ONE message in the channel:
+      * mismatches present -> delete the previous message and post a fresh one, so
+        Slack actually notifies every run (an edit never pings) and anything that
+        got corrected is gone;
+      * all clear -> edit the existing message in place (no ping), or post one if
+        there isn't one yet.
+    The message ts is remembered in state.json."""
     if dry_run or not SLACK_BOT_TOKEN or not SLACK_GC_CHANNEL:
         print(f"[dry-run / not configured] would POST to {SLACK_GC_CHANNEL or '(no channel set)'}:\n{text}\n")
         return False
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
     state = _load_state()
-    if state.get("channel") == SLACK_GC_CHANNEL and state.get("ts"):
-        resp = requests.post("https://slack.com/api/chat.update", headers=headers, timeout=15,
-                             json={"channel": SLACK_GC_CHANNEL, "ts": state["ts"],
-                                   "text": text, "blocks": blocks})
-        data = resp.json()
+    old_ts = state.get("ts") if state.get("channel") == SLACK_GC_CHANNEL else None
+
+    if old_ts and not has_mismatch:
+        data = requests.post("https://slack.com/api/chat.update", headers=headers, timeout=15,
+                             json={"channel": SLACK_GC_CHANNEL, "ts": old_ts,
+                                   "text": text, "blocks": blocks}).json()
         if data.get("ok"):
-            log("Updated the existing Slack message in place.")
+            log("All clear -- updated the existing Slack message in place.")
             return True
         log(f"chat.update failed ({data.get('error')}) -- posting a new message instead.")
-    resp = requests.post("https://slack.com/api/chat.postMessage", headers=headers, timeout=15,
-                         json={"channel": SLACK_GC_CHANNEL, "text": text, "blocks": blocks})
-    data = resp.json()
+    elif old_ts and has_mismatch:
+        data = requests.post("https://slack.com/api/chat.delete", headers=headers, timeout=15,
+                             json={"channel": SLACK_GC_CHANNEL, "ts": old_ts}).json()
+        if not data.get("ok"):
+            log(f"Could not delete the previous message ({data.get('error')}) -- posting the new one anyway.")
+
+    data = requests.post("https://slack.com/api/chat.postMessage", headers=headers, timeout=15,
+                         json={"channel": SLACK_GC_CHANNEL, "text": text, "blocks": blocks}).json()
     if not data.get("ok"):
         print(f"Slack chat.postMessage failed: {data}", file=sys.stderr)
         return False
     _save_state({"channel": SLACK_GC_CHANNEL, "ts": data.get("ts")})
-    log("Posted a new Slack message (its ts is saved so later runs edit it).")
+    log("Posted a new Slack message (ts saved).")
     return True
 
 
@@ -231,6 +240,7 @@ def load_fedex_rows(path: Path) -> list[dict]:
             "shipper": str(row.get("Shipper Name") or "").strip(),
             "address": address,
             "pu_closed_blank": _is_blank(row.get("PU Closed")),
+            "reas_blank": _is_blank(row.get("Reas Code")),
             "_addr_norm": normalize_address(address),
         })
     return rows
@@ -452,8 +462,10 @@ def find_mismatches(gc_rows: list[dict], fedex_rows: list[dict]) -> list[dict]:
     flagged = []
     for key, gcs in done_by_addr.items():
         fx = [r for r in fedex_rows if r["_addr_norm"] == key]
-        closed = sum(1 for r in fx if not r["pu_closed_blank"])
-        open_rows = [r for r in fx if r["pu_closed_blank"]]
+        # "Handled" in FedEx = PU Closed filled OR a reason code on file (same rule
+        # the FedEx risk monitor uses); only rows with BOTH empty are still open.
+        open_rows = [r for r in fx if r["pu_closed_blank"] and r["reas_blank"]]
+        closed = len(fx) - len(open_rows)
         n = min(len(gcs) - closed, len(open_rows))
         if n > 0:
             flagged.append({
@@ -496,7 +508,7 @@ def build_report(gc_rows: list[dict], fedex_rows: list[dict], now: datetime,
         {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"```{table}```"}},
         {"type": "context", "elements": [{"type": "mrkdwn",
-            "text": "GroundCloud shows these pickups *Delivered*, but FedEx's *PU Closed* is still blank for stops at that address."}]},
+            "text": "GroundCloud shows these pickups *Delivered*, but FedEx's *PU Closed* and *Reas Code* are both still empty for stops at that address."}]},
     ]
     return text, blocks
 
@@ -562,7 +574,7 @@ def run(headless: bool, dry_run: bool) -> int:
             f"best ratio={ratio:.2f} "
             + (f"FedEx addr={m['address']!r} PU-closed-blank={m['pu_closed_blank']}" if m else "no candidate"))
     text, blocks = build_report(gc_rows, fedex_rows, now, fedex_asof)
-    post_to_slack(text, blocks, dry_run)
+    post_to_slack(text, blocks, dry_run, has_mismatch=len(blocks) > 1)  # all-clear has a single block
     return 0
 
 
