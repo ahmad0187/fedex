@@ -497,13 +497,13 @@ def build_report(gc_rows: list[dict], fedex_rows: list[dict], now: datetime,
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary + "\n✅ No mismatch found during this hour."}}]
         return text, blocks
 
-    header = f"{'STN':<7}{'WA':<10}{'FEDEX SHIPPER':<24}{'ADDRESS':<32}{'GC DONE':<9}{'FX CLOSED':<11}{'OPEN'}"
+    header = f"{'STN':<7}{'WA':<17}{'FEDEX SHIPPER':<24}{'ADDRESS':<32}{'GC DONE':<9}{'FX CLOSED':<11}{'OPEN'}"
     lines = [header]
     for f in flagged:
         shipper = (f["fedex_shipper"] or "Unknown")[:22]
         address = (f["address"] or "")[:30]
         stn = str(int(f["fedex_station"])) if str(f["fedex_station"]).replace(".0", "").isdigit() else ""
-        lines.append(f"{stn:<7}{f['wa'][:9]:<10}{shipper:<24}{address:<32}{f['gc_done']:<9}{f['fx_closed']:<11}{f['fx_open']}")
+        lines.append(f"{stn:<7}{f['wa'][:16]:<17}{shipper:<24}{address:<32}{f['gc_done']:<9}{f['fx_closed']:<11}{f['fx_open']}")
     table = "\n".join(lines)
 
     text = f"GroundCloud/FedEx reconciliation: {total} mismatch(es)"
