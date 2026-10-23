@@ -512,6 +512,9 @@ def attempt_credential_login(page, log) -> bool:
             log(str(fields))
         except Exception:
             pass
+        # Okta's own explanation (wrong password / locked / expired / verify...) is
+        # in the visible text -- the input list alone can't tell us which it is.
+        _dump_login_page(page, log)
         return False
 
     log("Automatic login succeeded.")
