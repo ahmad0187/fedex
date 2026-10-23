@@ -68,10 +68,13 @@ def run_variant(p, name, headless, args, ctx_kwargs, init_script):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--headed", action="store_true", help="also try a headed variant (run under xvfb-run)")
+    ap.add_argument("--only", type=int, default=0, help="run just the first N variants (1 = a single login)")
     ap.add_argument("--pause", type=int, default=90, help="seconds to wait between variants")
     args = ap.parse_args()
 
     variants = list(VARIANTS) + ([HEADED_VARIANT] if args.headed else [])
+    if args.only:
+        variants = variants[:args.only]
     results = {}
     with sync_playwright() as p:
         for i, v in enumerate(variants):

@@ -401,25 +401,50 @@ _LOGIN_FIELD_SELECTOR = (
 )
 
 
-def find_login_scope(page, log):
+def find_login_scope(page, log, wait_sec: int = 25):
     """Returns whichever Page or Frame actually contains the login fields. Okta often
     renders its sign-in widget inside an iframe (seen live: #account-chooser-iframe)
     rather than at the top level, so a top-level-only search can silently find
-    nothing and skip the login attempt entirely."""
-    try:
-        if page.locator(_LOGIN_FIELD_SELECTOR).count() > 0:
-            return page
-    except Exception:
-        pass
-    for frame in page.frames:
+    nothing and skip the login attempt entirely. The widget is also rendered by JS
+    AFTER the page's title appears ("PurpleID - Sign In" with zero <input>s was seen
+    2026-10-23 for every attempt of the day), so poll for up to wait_sec seconds
+    instead of checking once."""
+    deadline = time.time() + wait_sec
+    while True:
         try:
-            if frame.locator(_LOGIN_FIELD_SELECTOR).count() > 0:
-                return frame
+            if page.locator(_LOGIN_FIELD_SELECTOR).count() > 0:
+                return page
         except Exception:
-            continue
-    log(f"No login fields found at top level or in any iframe. Frames present: "
+            pass
+        for frame in page.frames:
+            try:
+                if frame.locator(_LOGIN_FIELD_SELECTOR).count() > 0:
+                    return frame
+            except Exception:
+                continue
+        if time.time() >= deadline:
+            break
+        page.wait_for_timeout(500)
+    log(f"No login fields found at top level or in any iframe after {wait_sec}s. Frames present: "
         + str([f.url for f in page.frames]))
+    _dump_login_page(page, log)
     return page  # fall back so the caller's own diagnostics still fire
+
+
+def _dump_login_page(page, log) -> None:
+    """What is Okta actually showing? Visible text + saved HTML, so a blank/blocked/
+    'try again later' page is identifiable instead of guessed at."""
+    try:
+        txt = page.locator("body").inner_text(timeout=3000)
+        log(f"Login page body text (first 600 chars): {txt[:600]!r}")
+    except Exception as e:
+        log(f"Could not read the login page text: {e!r}")
+    try:
+        path = HERE / "debug_login.html"
+        path.write_text(page.content(), encoding="utf-8")
+        log(f"Saved the login page HTML to {path} ({path.stat().st_size} bytes)")
+    except Exception as e:
+        log(f"Could not save the login page HTML: {e!r}")
 
 
 def attempt_credential_login(page, log) -> bool:
