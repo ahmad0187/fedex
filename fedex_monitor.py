@@ -78,6 +78,10 @@ STATE_DB = HERE / "state.db"
 STATION_TZ = ZoneInfo("America/New_York")
 WARN_MINUTES = 60  # back to 1 hour -- was widened to 120 for testing on 2026-10-19
 FAILURE_ALERT_COOLDOWN_MIN = 120  # don't spam Slack more than once every 2h on failure
+# Set when Okta answers "Unable to sign in" to our username/password -- retrying a
+# rejected password only risks locking the account, so --watch stops and waits for .env.
+CREDENTIALS_REJECTED = False
+
 LOGIN_RETRY_BACKOFF_SEC = 120  # gap between retried logins in --watch mode (see
 # login_with_retries() -- was 60s; widened 2026-10-19 after console diagnostics
 # showed signs of a lingering server-side session colliding with the next login
@@ -515,6 +519,15 @@ def attempt_credential_login(page, log) -> bool:
         # Okta's own explanation (wrong password / locked / expired / verify...) is
         # in the visible text -- the input list alone can't tell us which it is.
         _dump_login_page(page, log)
+        try:
+            body = page.locator("body").inner_text(timeout=3000)
+            if re.search(r"unable to sign in|incorrect|invalid.*(password|credentials)|locked", body, re.I):
+                global CREDENTIALS_REJECTED
+                CREDENTIALS_REJECTED = True
+                log("Okta rejected the FedEx username/password -- NOT retrying (a few more "
+                    "failures can lock the account). Update FEDEX_PASSWORD in .env.")
+        except Exception:
+            pass
         return False
 
     log("Automatic login succeeded.")
@@ -1249,6 +1262,28 @@ def run_once(headless: bool, dry_run: bool) -> int:
     return 0 if ok else 1
 
 
+def wait_for_env_change(log, max_hours: int = 12) -> None:
+    """After a rejected password: do nothing (no more login attempts) until .env is
+    edited, then return so the caller exits and systemd restarts us with the new
+    values. Gives up waiting after max_hours."""
+    env_path = HERE / ".env"
+    try:
+        base = env_path.stat().st_mtime
+    except OSError:
+        base = None
+    log("Waiting for .env to be updated (checking every 60s), then restarting.")
+    waited = 0
+    while waited < max_hours * 3600:
+        time.sleep(60)
+        waited += 60
+        try:
+            if base is not None and env_path.stat().st_mtime != base:
+                log(".env changed -- restarting to pick up the new credentials.")
+                return
+        except OSError:
+            pass
+
+
 def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 20,
               keepalive_min: int = 4, max_consecutive_failures: int = 3) -> int:
     """Alternative to run_once for long-running use (systemd Type=simple instead of a
@@ -1386,6 +1421,8 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 20,
                     return True
                 consecutive_failures += 1
                 send_failure_alert(fail_reason)
+                if CREDENTIALS_REJECTED:
+                    break  # never retry a rejected password
                 if attempt < max_consecutive_failures:
                     log(f"Login attempt {attempt}/{max_consecutive_failures} failed -- "
                         f"retrying in {LOGIN_RETRY_BACKOFF_SEC}s.")
@@ -1406,6 +1443,8 @@ def run_watch(dry_run: bool, headless: bool, full_interval_min: int = 20,
                 time.sleep(wait_s)
 
             if not login_with_retries(close_old=False):
+                if CREDENTIALS_REJECTED:
+                    wait_for_env_change(log)
                 # Every attempt failed -- exit non-zero so systemd (Restart=always)
                 # starts the whole process over with a clean browser rather than
                 # looping forever inside one already-struggling run.
