@@ -98,17 +98,31 @@ ACTIVE_WINDOW_LABEL = (f"{ACTIVE_WINDOW_START_HOUR}:{ACTIVE_WINDOW_START_MINUTE:
                        f"{ACTIVE_WINDOW_END_HOUR}:00")
 
 
+# No pickups on Saturday/Sunday (confirmed 2026-10-26) -- stay completely idle then:
+# no FedEx login, no searches, no Slack. 0 = Monday ... 6 = Sunday.
+ACTIVE_WEEKDAYS = {0, 1, 2, 3, 4}
+
+
 def _next_active_window_start(now: datetime) -> datetime:
-    """If `now` is already inside the active window, returns `now` unchanged.
-    Otherwise returns the next moment the window opens (today's or tomorrow's
-    ACTIVE_WINDOW_START_HOUR)."""
-    start_today = now.replace(hour=ACTIVE_WINDOW_START_HOUR, minute=ACTIVE_WINDOW_START_MINUTE, second=0, microsecond=0)
-    end_today = now.replace(hour=ACTIVE_WINDOW_END_HOUR, minute=0, second=0, microsecond=0)
-    if now < start_today:
-        return start_today
-    if now >= end_today:
-        return start_today + timedelta(days=1)
-    return now
+    """If `now` is already inside the active window (on an active weekday), returns
+    `now` unchanged. Otherwise returns the next moment the window opens -- today's
+    start, or the start of the next active weekday (so Friday evening waits until
+    Monday morning)."""
+    day = now
+    for _ in range(8):
+        start = day.replace(hour=ACTIVE_WINDOW_START_HOUR, minute=ACTIVE_WINDOW_START_MINUTE,
+                            second=0, microsecond=0)
+        end = day.replace(hour=ACTIVE_WINDOW_END_HOUR, minute=0, second=0, microsecond=0)
+        if day.weekday() in ACTIVE_WEEKDAYS:
+            if day.date() == now.date():
+                if now < start:
+                    return start
+                if now < end:
+                    return now
+            else:
+                return start
+        day = day + timedelta(days=1)
+    return now  # unreachable unless ACTIVE_WEEKDAYS is empty
 
 class GracefulShutdown(BaseException):
     """Raised from a SIGTERM/SIGINT handler so `systemctl stop`/`restart` unwinds

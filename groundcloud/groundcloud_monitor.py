@@ -521,6 +521,10 @@ def build_report(gc_rows: list[dict], fedex_rows: list[dict], now: datetime,
 def run(headless: bool, dry_run: bool, fedex_file: Optional[str] = None) -> int:
     now = datetime.now(STATION_TZ)
 
+    if not dry_run and now.weekday() >= 5:
+        log("Saturday/Sunday -- no pickups, skipping.")
+        return 0
+
     mins = now.hour * 60 + now.minute
     if not dry_run and not (RUN_WINDOW_START[0] * 60 + RUN_WINDOW_START[1] <= mins
                             <= RUN_WINDOW_END[0] * 60 + RUN_WINDOW_END[1]):
