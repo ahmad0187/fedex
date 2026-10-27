@@ -291,6 +291,9 @@ def slack_api_post(channel: str, text: str, blocks: list[dict], dry_run: bool) -
     return data.get("ts")
 
 
+_last_slack_error = ""   # error code from the most recent failed chat.update
+
+
 def slack_api_update(channel: str, ts: str, text: str, blocks: list[dict], dry_run: bool) -> bool:
     """Edits an existing message (by channel + ts) via chat.update."""
     if dry_run or not SLACK_BOT_TOKEN or not channel or not ts:
@@ -304,6 +307,8 @@ def slack_api_update(channel: str, ts: str, text: str, blocks: list[dict], dry_r
     )
     data = resp.json()
     if not data.get("ok"):
+        global _last_slack_error
+        _last_slack_error = str(data.get("error") or "")
         print(f"Slack chat.update failed: {data}", file=sys.stderr)
         return False
     return True
@@ -399,6 +404,16 @@ def update_daily_manifest_channel(df, now: datetime, log, dry_run: bool) -> None
                 set_meta("daily_manifest_last_update", now.isoformat())
                 conn.commit()
                 log(f"Daily Manifest: updated today's message in place ({len(rows)} stop(s)).")
+            elif _last_slack_error in ("message_not_found", "cant_update_message", "edit_window_closed"):
+                # The message was deleted in Slack (or can't be edited any more) --
+                # post a fresh one instead of failing silently for the rest of the day.
+                log(f"Daily Manifest: can't edit the old message ({_last_slack_error}) -- posting a new one.")
+                ts = slack_api_post(SLACK_DAILY_CHANNEL, text, blocks, dry_run)
+                if ts:
+                    set_meta("daily_manifest_ts", ts)
+                    set_meta("daily_manifest_last_update", now.isoformat())
+                    conn.commit()
+                    log(f"Daily Manifest: posted a replacement message ({len(rows)} stop(s)).")
     conn.close()
 
 
