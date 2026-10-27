@@ -69,6 +69,11 @@ def _is_blank(v) -> bool:
     return str(v).strip() == ""
 
 
+def _clean(v) -> str:
+    """String value of a cell, with blank/NaN as '' (str(NaN) would print 'nan')."""
+    return "" if _is_blank(v) else str(v).strip()
+
+
 def load_manifest(path: str | Path) -> pd.DataFrame:
     """Reads the 'Stop Details' sheet. Works on both the legacy .xls FedEx exports
     and .xlsx, in case the export format ever changes."""
@@ -112,14 +117,14 @@ def find_at_risk(df: pd.DataFrame, now: datetime, warn_minutes: float = 60.0,
             key=(int(row["PU List"]), int(row["PUID"])),
             station=int(row["Station"]),
             wa=str(row["WA"]),
-            shipper_name=str(row.get("Shipper Name") or "").strip(),
+            shipper_name=_clean(row.get("Shipper Name")),
             address=", ".join(x for x in (
-                str(row.get("Address Line 1") or "").strip(),
-                str(row.get("City") or "").strip(),
-                str(row.get("State") or "").strip(),
+                _clean(row.get("Address Line 1")),
+                _clean(row.get("City")),
+                _clean(row.get("State")),
             ) if x),
-            city=str(row.get("City") or "").strip(),
-            state=str(row.get("State") or "").strip(),
+            city=_clean(row.get("City")),
+            state=_clean(row.get("State")),
             close=close_t,
             ready=_parse_hhmm(row.get("Ready")),
             minutes_to_close=round(minutes_left, 1),
@@ -222,12 +227,12 @@ def build_daily_rows(df: pd.DataFrame, now: datetime, warn_minutes: float = 60.0
         station = row.get("Station")
         rows.append({
             "station": int(station) if not pd.isna(station) else None,
-            "wa": str(row.get("WA") or "").strip(),
-            "shipper": str(row.get("Shipper Name") or "").strip(),
+            "wa": _clean(row.get("WA")).removesuffix(".0"),
+            "shipper": _clean(row.get("Shipper Name")),
             "address": ", ".join(x for x in (
-                str(row.get("Address Line 1") or "").strip(),
-                str(row.get("City") or "").strip(),
-                str(row.get("State") or "").strip(),
+                _clean(row.get("Address Line 1")),
+                _clean(row.get("City")),
+                _clean(row.get("State")),
             ) if x),
             "ready": ready_t.strftime("%H:%M") if ready_t else "",
             "close": close_t.strftime("%H:%M") if close_t else "",
