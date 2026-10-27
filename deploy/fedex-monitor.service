@@ -1,0 +1,18 @@
+[Unit]
+Description=FedEx Pickup Manifest monitor (--watch, weekdays 10:30-19:00 Eastern)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/fedex
+EnvironmentFile=/root/fedex/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/fedex/venv/bin/python3 /root/fedex/fedex_monitor.py --watch
+Restart=always
+RestartSec=30
+# Gives the monitor time to sign out of FedEx cleanly on stop/restart.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
